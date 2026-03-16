@@ -4,16 +4,35 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import re
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from feishu_bitable_api import (
     FeishuBitableClient,
     load_feishu_credentials,
     load_user_config,
     parse_iso_to_ms,
+)
+
+
+PLATFORM_VALUE_MAP = {
+    "github": "github",
+    "x": "x",
+    "xiaohongshu": "小红书",
+    "douyin": "抖音",
+    "other": "other",
+}
+
+SUMMARY_BANNED_PREFIX = re.compile(
+    r"^(该仓库|该收藏(?:内容)?|这个收藏(?:内容)?|此收藏(?:内容)?|本收藏(?:内容)?|本仓库)\s*[：:，, ]*"
 )
 
 
@@ -32,6 +51,15 @@ def parse_args() -> argparse.Namespace:
         help="本地同步状态缓存（用于增量优化）",
     )
     p.add_argument(
+        "--summary-cache",
+        default=str(skill_root / "output" / "summary-cache.json"),
+        help="内容梗概缓存（减少重复摘要调用）",
+    )
+    p.add_argument("--summary-api-key", default="", help="摘要模型 API key（可选，默认读 OPENAI_API_KEY）")
+    p.add_argument("--summary-model", default="", help="摘要模型名称（可选）")
+    p.add_argument("--summary-base-url", default="", help="摘要模型 API 基址（可选）")
+    p.add_argument("--disable-llm-summary", action="store_true", help="关闭 LLM 摘要，使用规则兜底")
+    p.add_argument(
         "--write-mode",
         choices=["create-only", "create-or-update"],
         default="create-only",
@@ -48,9 +76,21 @@ def load_json(path: str) -> dict[str, Any]:
 
 def normalize_platform(raw: str) -> str:
     text = (raw or "").strip().lower()
-    if text in {"github", "x", "xiaohongshu", "douyin", "other"}:
-        return text
-    return "other"
+    mapping = {
+        "github": "github",
+        "x": "x",
+        "xiaohongshu": "xiaohongshu",
+        "小红书": "xiaohongshu",
+        "douyin": "douyin",
+        "抖音": "douyin",
+        "other": "other",
+        "其他": "other",
+    }
+    return mapping.get(text, "other")
+
+
+def platform_select_value(platform_key: str) -> str:
+    return PLATFORM_VALUE_MAP.get(platform_key, "other")
 
 
 def normalize_link(value: Any) -> str:
@@ -65,24 +105,297 @@ def normalize_link(value: Any) -> str:
     return str(value).strip()
 
 
-def to_fields(record: dict[str, Any], link_field_type: int) -> dict[str, Any]:
+def _clean_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def _parse_int_count(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 else None
+    text = _clean_text(value).replace(",", "")
+    if not text:
+        return None
+    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kKmMwW万亿]?)", text)
+    if m:
+        base = float(m.group(1))
+        unit = m.group(2).lower()
+        factor = 1.0
+        if unit == "k":
+            factor = 1_000.0
+        elif unit == "m":
+            factor = 1_000_000.0
+        elif unit in {"w", "万"}:
+            factor = 10_000.0
+        elif unit == "亿":
+            factor = 100_000_000.0
+        val = int(base * factor)
+        return val if val >= 0 else None
+    try:
+        num = int(float(text))
+        return num if num >= 0 else None
+    except ValueError:
+        return None
+
+
+def _extract_repo_name_from_link(link: str) -> str:
+    try:
+        p = urlparse(link)
+        parts = [x for x in p.path.split("/") if x]
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_title(record: dict[str, Any]) -> str:
+    title = _clean_text(record.get("标题") or "")
+    if title:
+        return title[:120]
+    platform = normalize_platform(str(record.get("所属平台", "")))
+    link = _clean_text(record.get("链接"))
+    summary = _clean_text(record.get("内容梗概"))
+
+    if platform == "github":
+        repo = _extract_repo_name_from_link(link)
+        if repo:
+            return repo[:120]
+    if summary:
+        return summary[:50]
+    if link:
+        host = urlparse(link).netloc or link
+        return f"{platform_select_value(platform)} 收藏 - {host}"[:120]
+    return f"{platform_select_value(platform)} 收藏内容"
+
+
+def _fallback_summary(platform: str, title: str, raw_summary: str, link: str) -> str:
+    text = _clean_text(raw_summary)
+    if platform == "github":
+        repo = _extract_repo_name_from_link(link) or title or "这个项目"
+        if text:
+            return f"{repo}围绕{text[:72]}展开，包含可直接复用的实现思路与技术要点。"
+        return f"{repo}聚焦具体开发问题，建议结合 README 和目录结构快速判断可复用价值。"
+    if text:
+        return f"内容围绕{text[:78]}展开，适合按主题回看并提炼可执行的方法或观点。"
+    if platform == "douyin":
+        return "视频主题与观点已入库，可回看原视频和评论区补全上下文信息。"
+    if platform == "x":
+        return "帖子讨论已入库，可回看线程上下文和引用关系提炼关键结论。"
+    if platform == "xiaohongshu":
+        return "图文笔记已入库，可回看图片细节和评论反馈提炼实践要点。"
+    return "链接内容已入库，建议后续补充核心观点、适用场景和可执行结论。"
+
+
+def _normalize_summary_output(text: str, *, platform: str, title: str, raw_summary: str, link: str) -> str:
+    out = _clean_text(text).strip("“”\"' ")
+    out = SUMMARY_BANNED_PREFIX.sub("", out).strip()
+    if not out:
+        out = _fallback_summary(platform, title, raw_summary, link)
+    raw_clean = _clean_text(raw_summary).rstrip("。")
+    if raw_clean and out.rstrip("。") == raw_clean:
+        out = _fallback_summary(platform, title, raw_summary, link)
+    if len(out) > 140:
+        out = out[:140].rstrip()
+    if out and out[-1] not in "。！？":
+        out += "。"
+    return out
+
+
+def _http_post_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: int = 25) -> dict[str, Any]:
+    req = urllib.request.Request(
+        url=url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"摘要接口请求失败: HTTP {e.code}, body={raw[:400]}") from e
+
+
+def _resolve_summary_settings(args: argparse.Namespace, user_cfg: dict[str, Any]) -> tuple[str, str, str]:
+    cfg = user_cfg.get("summary_llm") if isinstance(user_cfg.get("summary_llm"), dict) else {}
+    api_key = (
+        args.summary_api_key.strip()
+        or os.getenv("FAVORITESHUB_SUMMARY_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+        or str(cfg.get("api_key") or "").strip()
+    )
+    model = (
+        args.summary_model.strip()
+        or os.getenv("FAVORITESHUB_SUMMARY_MODEL", "").strip()
+        or str(cfg.get("model") or "").strip()
+        or "gpt-4o-mini"
+    )
+    base_url = (
+        args.summary_base_url.strip()
+        or os.getenv("FAVORITESHUB_SUMMARY_BASE_URL", "").strip()
+        or os.getenv("OPENAI_BASE_URL", "").strip()
+        or str(cfg.get("base_url") or "").strip()
+        or "https://api.openai.com"
+    )
+    return api_key, model, base_url
+
+
+def load_summary_cache(path: str) -> dict[str, str]:
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, str] = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str):
+            result[k] = v
+    return result
+
+
+def save_summary_cache(path: str, cache: dict[str, str]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class ChineseSummarizer:
+    def __init__(self, *, api_key: str, model: str, base_url: str, cache: dict[str, str], enabled: bool):
+        self.api_key = api_key.strip()
+        self.model = model.strip()
+        self.base_url = base_url.strip().rstrip("/")
+        self.cache = cache
+        self.enabled = enabled and bool(self.api_key) and bool(self.model)
+        self.cache_hits = 0
+        self.llm_calls = 0
+        self.llm_failures = 0
+
+    def _cache_key(self, platform: str, title: str, raw_summary: str, link: str) -> str:
+        raw = "|".join([platform, _clean_text(title), _clean_text(raw_summary), _clean_text(link)])
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _chat_completions_url(self) -> str:
+        if self.base_url.endswith("/chat/completions"):
+            return self.base_url
+        if self.base_url.endswith("/v1"):
+            return f"{self.base_url}/chat/completions"
+        return f"{self.base_url}/v1/chat/completions"
+
+    def _call_llm(self, platform: str, title: str, raw_summary: str, link: str) -> str:
+        prompt = (
+            "请根据以下收藏信息生成 1 句中文简介（40~90 字）。\n"
+            "要求：\n"
+            "1) 必须概括，不要照抄输入原文；\n"
+            "2) 不要以“该仓库”或“该收藏”开头；\n"
+            "3) 直接输出简介正文，不要加序号、引号或前缀。\n\n"
+            f"平台: {platform_select_value(platform)}\n"
+            f"标题: {_clean_text(title)}\n"
+            f"链接: {_clean_text(link)}\n"
+            f"原始摘要/文本: {_clean_text(raw_summary)}"
+        )
+        body = {
+            "model": self.model,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是中文内容整理助手，擅长将收藏内容改写成简洁、自然、可读的中文简介。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        payload = _http_post_json(self._chat_completions_url(), headers, body)
+        choices = payload.get("choices") or []
+        if not choices:
+            return ""
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    txt = part.get("text")
+                    if isinstance(txt, str) and txt.strip():
+                        texts.append(txt.strip())
+            return " ".join(texts)
+        return ""
+
+    def summarize(self, *, platform: str, title: str, raw_summary: str, link: str) -> str:
+        key = self._cache_key(platform, title, raw_summary, link)
+        cached = self.cache.get(key)
+        if isinstance(cached, str) and cached.strip():
+            self.cache_hits += 1
+            return cached
+
+        fallback = _fallback_summary(platform, title, raw_summary, link)
+        output = ""
+        if self.enabled:
+            self.llm_calls += 1
+            try:
+                output = self._call_llm(platform, title, raw_summary, link)
+            except Exception:
+                self.llm_failures += 1
+                output = ""
+        final_summary = _normalize_summary_output(
+            output or fallback,
+            platform=platform,
+            title=title,
+            raw_summary=raw_summary,
+            link=link,
+        )
+        self.cache[key] = final_summary
+        return final_summary
+
+
+def to_fields(
+    record: dict[str, Any],
+    link_field_type: int,
+    *,
+    summarizer: ChineseSummarizer,
+    default_status: bool,
+) -> dict[str, Any]:
     link = str(record.get("链接", "")).strip()
+    platform_key = normalize_platform(str(record.get("所属平台", "")))
+    title = _extract_title(record)
+    summary_zh = summarizer.summarize(
+        platform=platform_key,
+        title=title,
+        raw_summary=str(record.get("内容梗概", "")),
+        link=link,
+    )
     fields: dict[str, Any] = {
-        "所属平台": record.get("所属平台", ""),
-        "内容梗概": record.get("内容梗概", ""),
+        "标题": title,
+        "所属平台": platform_select_value(platform_key),
+        "内容梗概": summary_zh,
         "收录时间": parse_iso_to_ms(record.get("收录时间")),
     }
     if link_field_type == 15:
         fields["链接"] = {"text": link, "link": link}
     else:
         fields["链接"] = link
+    if default_status:
+        status = _clean_text(record.get("状态") or "未学习")
+        if status not in {"已学习", "已过期", "未学习"}:
+            status = "未学习"
+        fields["状态"] = status
 
-    count_val = record.get("收藏或星标数量")
-    if count_val is not None and str(count_val).strip() != "":
-        try:
-            fields["收藏或星标数量"] = float(count_val)
-        except ValueError:
-            pass
+    count_val = _parse_int_count(record.get("收藏或星标数量"))
+    if count_val is not None:
+        fields["收藏或星标数量"] = count_val
     return fields
 
 
@@ -141,6 +454,17 @@ def main() -> None:
         override_base_url=args.base_url,
     )
     client = FeishuBitableClient(app_id, app_secret, base_url)
+
+    summary_cache = load_summary_cache(args.summary_cache)
+    summary_api_key, summary_model, summary_base_url = _resolve_summary_settings(args, user_cfg)
+    summarizer = ChineseSummarizer(
+        api_key=summary_api_key,
+        model=summary_model,
+        base_url=summary_base_url,
+        cache=summary_cache,
+        enabled=(not args.disable_llm_summary),
+    )
+
     state = load_state(args.state)
     state_tables = state.setdefault("tables", {})
 
@@ -152,6 +476,13 @@ def main() -> None:
         "skipped_existing": 0,
         "errors": 0,
         "write_mode": args.write_mode,
+        "llm_summary": {
+            "enabled": summarizer.enabled,
+            "model": summarizer.model if summarizer.enabled else "",
+            "cache_hits": 0,
+            "llm_calls": 0,
+            "llm_failures": 0,
+        },
         "by_platform": {},
     }
 
@@ -190,7 +521,6 @@ def main() -> None:
             if not link:
                 p_skipped += 1
                 continue
-            fields = to_fields(row, link_field_type)
             if args.dry_run:
                 if link not in existing:
                     p_created += 1
@@ -202,9 +532,11 @@ def main() -> None:
 
             try:
                 if link in existing and args.write_mode == "create-or-update":
+                    fields = to_fields(row, link_field_type, summarizer=summarizer, default_status=False)
                     client.update_record(app_token, table_id, existing[link], fields)
                     p_updated += 1
                 elif link not in existing:
+                    fields = to_fields(row, link_field_type, summarizer=summarizer, default_status=True)
                     created = client.create_record(app_token, table_id, fields)
                     created_id = created.get("record_id")
                     if created_id:
@@ -232,8 +564,13 @@ def main() -> None:
             "skipped_existing": p_skipped_existing,
         }
 
+    summary["llm_summary"]["cache_hits"] = summarizer.cache_hits
+    summary["llm_summary"]["llm_calls"] = summarizer.llm_calls
+    summary["llm_summary"]["llm_failures"] = summarizer.llm_failures
+
     if not args.dry_run:
         save_state(args.state, state)
+        save_summary_cache(args.summary_cache, summary_cache)
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

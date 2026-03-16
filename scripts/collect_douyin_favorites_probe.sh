@@ -62,6 +62,49 @@ openclaw browser wait --target-id "$TARGET_ID" --load domcontentloaded --timeout
 
 EXTRACT_JS="$(cat <<'EOF'
 () => {
+  const parseCompact = (raw) => {
+    const text = (raw || '').replace(/,/g, '').trim();
+    if (!text) return null;
+    const m = text.match(/^([0-9]+(?:\.[0-9]+)?)\s*([kKmMwW万亿wW]?)$/);
+    if (!m) return null;
+    const base = Number(m[1]);
+    if (!Number.isFinite(base)) return null;
+    const unit = (m[2] || '').toLowerCase();
+    let factor = 1;
+    if (unit === 'k') factor = 1000;
+    else if (unit === 'm') factor = 1000000;
+    else if (unit === 'w' || unit === '万') factor = 10000;
+    else if (unit === '亿') factor = 100000000;
+    const out = Math.round(base * factor);
+    if (!Number.isFinite(out) || out < 0 || out > 1000000000) return null;
+    return out;
+  };
+
+  const pickCountFromCard = (card) => {
+    const candidateNodes = [
+      ...card.querySelectorAll('[data-e2e*="like"], [data-e2e*="collect"], [class*="like"], [class*="digg"], [class*="collect"], [class*="count"], span')
+    ].slice(0, 120);
+    for (const node of candidateNodes) {
+      const t = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 24) continue;
+      const m = t.match(/([0-9]+(?:\.[0-9]+)?\s*[kKmMwW万亿]?)/);
+      if (!m) continue;
+      const n = parseCompact(m[1]);
+      if (n !== null) return n;
+    }
+    const lines = (card.innerText || '')
+      .split('\n')
+      .map((x) => x.trim())
+      .filter((x) => x && x.length <= 24);
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const m = lines[i].match(/^([0-9]+(?:\.[0-9]+)?\s*[kKmMwW万亿]?)$/);
+      if (!m) continue;
+      const n = parseCompact(m[1]);
+      if (n !== null) return n;
+    }
+    return null;
+  };
+
   const text = document.body?.innerText || '';
   const loginSignals = [
     /登录后即可观看喜欢、收藏的视频/,
@@ -73,19 +116,36 @@ EXTRACT_JS="$(cat <<'EOF'
   ];
   const needsLogin = loginSignals.some((r) => r.test(text));
 
-  const links = [...document.querySelectorAll('a[href*=\"/video/\"]')]
-    .map((a) => {
+  const seen = new Set();
+  const records = [];
+  const anchors = [...document.querySelectorAll('a[href*="/video/"]')];
+  for (const a of anchors) {
+    let url = '';
+    try {
       const u = new URL(a.getAttribute('href'), location.origin);
       u.search = '';
-      return u.toString();
-    })
-    .filter((v, i, arr) => v && arr.indexOf(v) === i);
+      url = u.toString();
+    } catch (e) {
+      url = '';
+    }
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    const card = a.closest('section,article,div') || a.parentElement || a;
+    const cardText = (card?.innerText || '').replace(/\s+/g, ' ').trim();
+    const favCount = pickCountFromCard(card || a);
+    records.push({
+      link: url,
+      title: (`抖音视频 ${(url.split('/').pop() || '')}`).trim(),
+      summary: cardText.slice(0, 240),
+      favorite_or_star_count: favCount,
+    });
+  }
 
   return {
     page_url: location.href,
     title: document.title || '',
     needs_login: needsLogin,
-    links: (needsLogin ? [] : links)
+    records: (needsLogin ? [] : records)
   };
 }
 EOF
@@ -96,7 +156,7 @@ SCROLL_JS='() => {
   return true;
 }'
 
-ACC_LINKS='[]'
+ACC_ITEMS='[]'
 HEAD_CANDIDATES='[]'
 BOUNDARY_HIT=false
 NO_GROWTH=0
@@ -109,13 +169,14 @@ while [ "$ROUND" -le "$MAX_SCROLL_ROUNDS" ]; do
   EVAL_JSON="$(oc_eval "$TARGET_ID" "$EXTRACT_JS")"
   LAST_EVAL="$EVAL_JSON"
   NEEDS_LOGIN="$(echo "$EVAL_JSON" | jq -r '.result.needs_login // false')"
-  ROUND_LINKS="$(echo "$EVAL_JSON" | jq -c '.result.links // []')"
+  ROUND_ITEMS="$(echo "$EVAL_JSON" | jq -c '.result.records // []')"
 
   if [ "$ROUND" -eq 1 ]; then
-    HEAD_CANDIDATES="$(echo "$ROUND_LINKS" | jq -c '
-      reduce .[] as $u ({seen: {}, out: []};
-        if ($u | length) == 0 or .seen[$u] then .
-        else .seen[$u] = true | .out += [$u]
+    HEAD_CANDIDATES="$(echo "$ROUND_ITEMS" | jq -c '
+      reduce .[] as $it ({seen: {}, out: []};
+        ($it.link // "") as $u
+        | if ($u | length) == 0 or .seen[$u] then .
+          else .seen[$u] = true | .out += [$u]
         end
       ) | .out[:10]
     ')"
@@ -124,23 +185,24 @@ while [ "$ROUND" -le "$MAX_SCROLL_ROUNDS" ]; do
     fi
   fi
 
-  ACC_LINKS="$(jq -c -n --argjson acc "$ACC_LINKS" --argjson cur "$ROUND_LINKS" '
+  ACC_ITEMS="$(jq -c -n --argjson acc "$ACC_ITEMS" --argjson cur "$ROUND_ITEMS" '
     ($acc + $cur)
-    | reduce .[] as $u ({seen: {}, out: []};
-        if ($u | length) == 0 or .seen[$u] then .
-        else .seen[$u] = true | .out += [$u]
+    | reduce .[] as $it ({seen: {}, out: []};
+        ($it.link // "") as $u
+        | if ($u | length) == 0 or .seen[$u] then .
+          else .seen[$u] = true | .out += [$it]
         end
       )
     | .out
   ')"
 
   if [ "$FIRST_RUN" = false ] && [ "$BOUNDARY_HIT" = false ]; then
-    if echo "$ROUND_LINKS" | jq -e --argjson boundary "$BOUNDARY_JSON" 'any(.[]?; (($boundary | index(.)) != null))' >/dev/null 2>&1; then
+    if echo "$ROUND_ITEMS" | jq -e --argjson boundary "$BOUNDARY_JSON" 'any(.[]?; (($boundary | index(.link // "")) != null))' >/dev/null 2>&1; then
       BOUNDARY_HIT=true
     fi
   fi
 
-  CUR_COUNT="$(echo "$ACC_LINKS" | jq 'length')"
+  CUR_COUNT="$(echo "$ACC_ITEMS" | jq 'length')"
   if [ "$CUR_COUNT" -eq "$PREV_COUNT" ]; then
     NO_GROWTH=$((NO_GROWTH + 1))
   else
@@ -164,47 +226,48 @@ while [ "$ROUND" -le "$MAX_SCROLL_ROUNDS" ]; do
 done
 
 if [ "$FIRST_RUN" = false ]; then
-  FILTERED_LINKS="$(echo "$ACC_LINKS" | jq -c --argjson boundary "$BOUNDARY_JSON" '
-    reduce .[] as $u (
+  FILTERED_ITEMS="$(echo "$ACC_ITEMS" | jq -c --argjson boundary "$BOUNDARY_JSON" '
+    reduce .[] as $it (
       {stop: false, out: []};
       if .stop then .
-      elif (($boundary | index($u)) != null) then .stop = true
-      else .out += [$u]
+      elif (($boundary | index($it.link // "")) != null) then .stop = true
+      else .out += [$it]
       end
     ) | .out
   ')"
 else
-  FILTERED_LINKS="$ACC_LINKS"
+  FILTERED_ITEMS="$ACC_ITEMS"
 fi
 
 if [ "$LIMIT" -gt 0 ]; then
-  FILTERED_LINKS="$(echo "$FILTERED_LINKS" | jq -c --argjson lim "$LIMIT" '.[0:$lim]')"
+  FILTERED_ITEMS="$(echo "$FILTERED_ITEMS" | jq -c --argjson lim "$LIMIT" '.[0:$lim]')"
 fi
 
 NOW_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-echo "$LAST_EVAL" | jq --arg now "$NOW_ISO" --arg mode "$MODE" --argjson links "$FILTERED_LINKS" '{
+echo "$LAST_EVAL" | jq --arg now "$NOW_ISO" --arg mode "$MODE" --argjson items "$FILTERED_ITEMS" '{
   source: "douyin",
   fetched_at: $now,
   mode: $mode,
   page: .result.page_url,
-  status: (if .result.needs_login then "needs_login" elif (($links | length) > 0) then "ok" else "no_records" end),
+  status: (if .result.needs_login then "needs_login" elif (($items | length) > 0) then "ok" else "no_records" end),
   records: [
-    $links[]? | {
+    $items[]? | {
       platform: "douyin",
-      link: .,
-      summary: "",
-      favorite_or_star_count: null,
+      title: (.title // ("抖音视频 " + (((.link // "") | split("/") | last) // ""))),
+      link: (.link // ""),
+      summary: (.summary // ""),
+      favorite_or_star_count: (.favorite_or_star_count // null),
       ingested_at: $now
     }
   ]
 }' > "$OUT_FILE"
 
 if [ "$NEEDS_LOGIN" = "false" ]; then
-  FILTERED_COUNT="$(echo "$FILTERED_LINKS" | jq 'length')"
+  FILTERED_COUNT="$(echo "$FILTERED_ITEMS" | jq 'length')"
   if [ "$FIRST_RUN" = true ] || [ "$FILTERED_COUNT" -gt 0 ]; then
     NEW_HEADS="$HEAD_CANDIDATES"
     if [ "$(echo "$NEW_HEADS" | jq 'length')" -eq 0 ]; then
-      NEW_HEADS="$(echo "$FILTERED_LINKS" | jq -c 'map(select(. != null and . != "")) | .[:10]')"
+      NEW_HEADS="$(echo "$FILTERED_ITEMS" | jq -c 'map(.link // "") | map(select(. != "")) | .[:10]')"
     fi
     if [ "$(echo "$NEW_HEADS" | jq 'length')" -eq 0 ]; then
       NEW_HEADS="$BOUNDARY_JSON"

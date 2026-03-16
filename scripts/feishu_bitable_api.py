@@ -292,6 +292,24 @@ class FeishuBitableClient:
         )
         return (payload.get("data") or {}).get("app") or {}
 
+    def update_app_name(self, app_token: str, name: str) -> dict[str, Any]:
+        """Best-effort rename for bitable app."""
+        last_err: Exception | None = None
+        for method in ("PUT", "PATCH"):
+            try:
+                url = self._url(f"/open-apis/bitable/v1/apps/{app_token}")
+                payload = self._ensure_ok(
+                    _http_json(method, url, headers=self._auth_headers(), data={"name": name}),
+                    f"bitable.app.update.{method.lower()}",
+                )
+                return (payload.get("data") or {}).get("app") or {}
+            except Exception as e:  # pragma: no cover
+                last_err = e
+                continue
+        if last_err:
+            raise last_err
+        raise FeishuApiError("update_app_name failed")
+
     def list_tables(self, app_token: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         page_token: str | None = None
@@ -321,6 +339,21 @@ class FeishuBitableClient:
         )
         return (payload.get("data") or {}).get("table") or {}
 
+    def update_table_name(self, app_token: str, table_id: str, name: str) -> dict[str, Any]:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}")
+        payload = self._ensure_ok(
+            _http_json("PUT", url, headers=self._auth_headers(), data={"name": name}),
+            "bitable.appTable.update",
+        )
+        return (payload.get("data") or {}).get("table") or {}
+
+    def delete_table(self, app_token: str, table_id: str) -> None:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}")
+        self._ensure_ok(
+            _http_json("DELETE", url, headers=self._auth_headers()),
+            "bitable.appTable.delete",
+        )
+
     def list_fields(self, app_token: str, table_id: str) -> list[dict[str, Any]]:
         url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields", {"page_size": 500})
         payload = self._ensure_ok(
@@ -331,14 +364,48 @@ class FeishuBitableClient:
 
     def create_field(self, app_token: str, table_id: str, field_name: str, field_type: int) -> dict[str, Any]:
         url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields")
+        payload = self._ensure_ok(_http_json("POST", url, headers=self._auth_headers(), data={"field_name": field_name, "type": field_type}), "bitable.appTableField.create")
+        return (payload.get("data") or {}).get("field") or {}
+
+    def create_field_with_property(
+        self,
+        app_token: str,
+        table_id: str,
+        field_name: str,
+        field_type: int,
+        property_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields")
+        body: dict[str, Any] = {"field_name": field_name, "type": field_type}
+        if property_data:
+            body["property"] = property_data
         payload = self._ensure_ok(
-            _http_json(
-                "POST",
-                url,
-                headers=self._auth_headers(),
-                data={"field_name": field_name, "type": field_type},
-            ),
+            _http_json("POST", url, headers=self._auth_headers(), data=body),
             "bitable.appTableField.create",
+        )
+        return (payload.get("data") or {}).get("field") or {}
+
+    def update_field(
+        self,
+        app_token: str,
+        table_id: str,
+        field_id: str,
+        *,
+        field_name: str | None = None,
+        field_type: int | None = None,
+        property_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}")
+        body: dict[str, Any] = {}
+        if field_name is not None:
+            body["field_name"] = field_name
+        if field_type is not None:
+            body["type"] = field_type
+        if property_data is not None:
+            body["property"] = property_data
+        payload = self._ensure_ok(
+            _http_json("PUT", url, headers=self._auth_headers(), data=body),
+            "bitable.appTableField.update",
         )
         return (payload.get("data") or {}).get("field") or {}
 
@@ -378,3 +445,40 @@ class FeishuBitableClient:
             "bitable.appTableRecord.update",
         )
         return (payload.get("data") or {}).get("record") or {}
+
+    def add_permission_member(
+        self,
+        token: str,
+        *,
+        member_id: str,
+        member_type: str = "email",
+        perm: str = "full_access",
+        file_type: str = "bitable",
+    ) -> dict[str, Any]:
+        """Grant collaborator permission to bitable file.
+
+        Tries drive v1 then v2 for compatibility.
+        """
+        params = {"type": file_type}
+        body = {
+            "member_id": member_id,
+            "member_type": member_type,
+            "perm": perm,
+        }
+        last_err: Exception | None = None
+        for path, api_name in [
+            (f"/open-apis/drive/v1/permissions/{token}/members", "drive.permission.member.add.v1"),
+            (f"/open-apis/drive/v2/permissions/{token}/members", "drive.permission.member.add.v2"),
+        ]:
+            try:
+                url = self._url(path, params)
+                payload = self._ensure_ok(
+                    _http_json("POST", url, headers=self._auth_headers(), data=body),
+                    api_name,
+                )
+                return (payload.get("data") or {}).get("member") or {}
+            except Exception as e:  # pragma: no cover
+                last_err = e
+        if last_err:
+            raise last_err
+        raise FeishuApiError("add_permission_member failed")

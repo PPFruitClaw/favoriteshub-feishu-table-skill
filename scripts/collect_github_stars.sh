@@ -124,6 +124,7 @@ echo "$RESULT_NODES" | jq --arg now "$NOW_ISO" --arg mode "$MODE" '{
   records: [
     .[]? | {
       platform: "github",
+      title: (.nameWithOwner // ""),
       link: .url,
       summary: ((.nameWithOwner // "") + " " + (.description // "")) | gsub("\\s+"; " ") | .[0:300],
       favorite_or_star_count: (.stargazerCount // null),

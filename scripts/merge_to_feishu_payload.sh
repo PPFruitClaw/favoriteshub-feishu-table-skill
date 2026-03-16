@@ -31,6 +31,7 @@ printf '[]' > "$TMP_FILE"
 for f in "${INPUTS[@]}"; do
   if [ -f "$f" ]; then
     jq -s '.[0] + ((.[1].records // []) | map({
+      "标题": (.title // ""),
       "所属平台": .platform,
       "链接": .link,
       "内容梗概": (.summary // ""),

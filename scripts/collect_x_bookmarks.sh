@@ -60,14 +60,54 @@ TARGET_ID="$(echo "$OPEN_JSON" | jq -r '.targetId')"
 
 openclaw browser wait --target-id "$TARGET_ID" --load domcontentloaded --timeout-ms 45000 --json >/dev/null
 
-EXTRACT_JS="() => {
-  const cards = [...document.querySelectorAll('article[data-testid=\"tweet\"]')];
+EXTRACT_JS="$(cat <<'EOF'
+() => {
+  const parseCompact = (raw) => {
+    const text = (raw || '').replace(/,/g, '').trim();
+    if (!text) return null;
+    const m = text.match(/^([0-9]+(?:\.[0-9]+)?)\s*([kKmMwW万亿]?)$/);
+    if (!m) return null;
+    const base = Number(m[1]);
+    if (!Number.isFinite(base)) return null;
+    const unit = (m[2] || '').toLowerCase();
+    let factor = 1;
+    if (unit === 'k') factor = 1000;
+    else if (unit === 'm') factor = 1000000;
+    else if (unit === 'w' || unit === '万') factor = 10000;
+    else if (unit === '亿') factor = 100000000;
+    const out = Math.round(base * factor);
+    return Number.isFinite(out) ? out : null;
+  };
+
+  const metricFromCard = (card, testId) => {
+    const node = card.querySelector(`[data-testid="${testId}"]`) || card.querySelector(`button[data-testid="${testId}"]`);
+    if (!node) return null;
+    const aria = (node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+    const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+    const candidates = [aria, text];
+    for (const c of candidates) {
+      const m = c.match(/([0-9]+(?:\.[0-9]+)?\s*[kKmMwW万亿]?)/);
+      if (m) {
+        const n = parseCompact(m[1]);
+        if (n !== null) return n;
+      }
+    }
+    return null;
+  };
+
+  const cards = [...document.querySelectorAll('article[data-testid="tweet"]')];
   const items = cards.map((card) => {
-    const linkEl = card.querySelector('a[href*=\"/status/\"]');
-    const textEl = card.querySelector('[data-testid=\"tweetText\"]');
+    const linkEl = card.querySelector('a[href*="/status/"]');
+    const textEl = card.querySelector('[data-testid="tweetText"]');
     const url = linkEl ? new URL(linkEl.getAttribute('href'), location.origin).toString() : null;
-    const text = (textEl?.innerText || card.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 400);
-    return { url, text };
+    const text = (textEl?.innerText || card.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+    const likeCount = metricFromCard(card, 'like');
+    const bookmarkCount = metricFromCard(card, 'bookmark');
+    return {
+      url,
+      text,
+      favorite_or_star_count: (likeCount ?? bookmarkCount ?? null),
+    };
   }).filter((x) => x.url);
   const pageText = (document.body?.innerText || '').slice(0, 2000);
   const requiresLogin = /log in|sign in|登录/i.test(pageText) && items.length === 0;
@@ -78,7 +118,9 @@ EXTRACT_JS="() => {
     count: items.length,
     items
   };
-}"
+}
+EOF
+)"
 
 SCROLL_JS='() => {
   window.scrollBy(0, Math.floor(window.innerHeight * 0.95));
@@ -197,9 +239,10 @@ echo "$FILTERED_ITEMS" | jq --arg now "$NOW_ISO" --arg page "$PAGE_URL" --arg mo
   records: [
     .[]? | {
       platform: "x",
+      title: ((.text // "") | gsub("\\s+"; " ") | .[0:40]),
       link: .url,
       summary: (.text // ""),
-      favorite_or_star_count: null,
+      favorite_or_star_count: (.favorite_or_star_count // null),
       ingested_at: $now
     }
   ]

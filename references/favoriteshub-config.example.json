@@ -4,6 +4,19 @@
     "app_secret": "xxxxxxxxxxxxxxxx",
     "base_url": "https://open.feishu.cn",
     "app_token": "",
-    "folder_token": ""
+    "folder_token": "",
+    "owner_email": "you@example.com",
+    "share_members": [
+      {
+        "member_type": "email",
+        "member_id": "you@example.com",
+        "perm": "full_access"
+      }
+    ]
+  },
+  "summary_llm": {
+    "model": "gpt-4o-mini",
+    "base_url": "https://api.openai.com",
+    "api_key": "${OPENAI_API_KEY}"
   }
 }

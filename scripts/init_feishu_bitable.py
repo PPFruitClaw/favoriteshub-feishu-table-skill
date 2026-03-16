@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -16,14 +17,32 @@ from feishu_bitable_api import (
 )
 
 TABLES = ["github", "x", "xiaohongshu", "douyin", "other"]
+TABLE_DISPLAY_NAMES = {
+    "github": "github",
+    "x": "x",
+    "xiaohongshu": "小红书",
+    "douyin": "抖音",
+    "other": "other",
+}
+TABLE_NAME_ALIASES = {
+    "xiaohongshu": ["xiaohongshu", "小红书"],
+    "douyin": ["douyin", "抖音"],
+    "github": ["github"],
+    "x": ["x"],
+    "other": ["other", "其他"],
+}
+PLATFORM_OPTIONS = [{"name": TABLE_DISPLAY_NAMES[k]} for k in TABLES]
+STATUS_OPTIONS = [{"name": x} for x in ["已学习", "已过期", "未学习"]]
+DEFAULT_GARBAGE_TABLE_NAMES = {"数据表", "表格", "表格1", "table1", "Table1"}
 
-# 1=Text, 2=Number, 5=DateTime, 15=URL
-REQUIRED_FIELDS: list[tuple[str, int]] = [
-    ("所属平台", 1),
-    ("链接", 15),
-    ("内容梗概", 1),
-    ("收藏或星标数量", 2),
-    ("收录时间", 5),
+# 1=Text, 2=Number, 3=SingleSelect, 5=DateTime, 15=URL
+REQUIRED_FIELDS: list[tuple[str, int, dict[str, Any] | None]] = [
+    ("所属平台", 3, {"options": PLATFORM_OPTIONS}),
+    ("状态", 3, {"options": STATUS_OPTIONS}),
+    ("链接", 15, None),
+    ("内容梗概", 1, None),
+    ("收藏或星标数量", 2, None),
+    ("收录时间", 5, None),
 ]
 
 
@@ -33,9 +52,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--app-id", default="", help="飞书 app_id（可选，优先级最高）")
     p.add_argument("--app-secret", default="", help="飞书 app_secret（可选，优先级最高）")
     p.add_argument("--base-url", default="", help="飞书 OpenAPI 域名（可选）")
-    p.add_argument("--name", default="FavoritesHub-FeishuTable", help="新建多维表格名称（未提供 app_token 时生效）")
+    p.add_argument("--name", default="FavoritesHub-多平台收藏中心", help="新建多维表格名称（未提供 app_token 时生效）")
     p.add_argument("--app-token", default="", help="已有多维表格 app_token（可选）")
     p.add_argument("--folder-token", default="", help="创建新多维表格时放置目录 token（可选）")
+    p.add_argument("--owner-email", default="", help="真实飞书用户邮箱（默认授予 full_access）")
+    p.add_argument(
+        "--share-member",
+        action="append",
+        default=[],
+        help="共享成员，格式 type:id[:perm]，例如 email:alice@example.com:full_access",
+    )
+    p.add_argument(
+        "--cleanup-force",
+        action="store_true",
+        help="强制清理默认垃圾表（即使含历史记录）",
+    )
+    p.add_argument(
+        "--allow-bot-only",
+        action="store_true",
+        help="允许仅机器人可编辑（默认关闭，建议保留真实用户编辑权限）",
+    )
     p.add_argument(
         "--out",
         default=str(Path(__file__).resolve().parent.parent / "output" / "feishu-target.json"),
@@ -49,36 +85,188 @@ def ensure_tables(client: FeishuBitableClient, app_token: str) -> dict[str, dict
     by_name = {str(t.get("name", "")).strip(): t for t in all_tables if t.get("name")}
     result: dict[str, dict[str, Any]] = {}
 
-    for table_name in TABLES:
-        table = by_name.get(table_name)
+    for table_key in TABLES:
+        desired_name = TABLE_DISPLAY_NAMES.get(table_key, table_key)
+        table = by_name.get(desired_name)
         if not table:
-            table = client.create_table(app_token, table_name)
+            for alias in TABLE_NAME_ALIASES.get(table_key, []):
+                if alias in by_name:
+                    table = by_name[alias]
+                    break
+        if not table:
+            table = client.create_table(app_token, desired_name)
             # Some API responses return only table metadata without id, re-read table list as fallback.
             if not table.get("table_id"):
                 refreshed = client.list_tables(app_token)
                 by_name = {str(t.get("name", "")).strip(): t for t in refreshed if t.get("name")}
-                table = by_name.get(table_name, table)
+                table = by_name.get(desired_name, table)
+        else:
+            current_name = str(table.get("name", "")).strip()
+            table_id = str(table.get("table_id", "")).strip()
+            if table_id and current_name != desired_name:
+                try:
+                    table = client.update_table_name(app_token, table_id, desired_name) or table
+                except Exception:
+                    pass
         table_id = table.get("table_id")
         if not table_id:
-            raise RuntimeError(f"未获取到 table_id: {table_name}")
-        result[table_name] = {"table_id": table_id}
+            raise RuntimeError(f"未获取到 table_id: {table_key}")
+        result[table_key] = {"table_id": table_id}
     return result
 
 
+def _find_primary_field(fields: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for f in fields:
+        if bool(f.get("is_primary")):
+            return f
+        prop = f.get("property") or {}
+        if isinstance(prop, dict) and bool(prop.get("is_primary")):
+            return f
+    return fields[0] if fields else None
+
+
+def ensure_primary_title_field(client: FeishuBitableClient, app_token: str, table_id: str) -> None:
+    fields = client.list_fields(app_token, table_id)
+    primary = _find_primary_field(fields)
+    if not primary:
+        return
+    field_id = str(primary.get("field_id") or "")
+    field_name = str(primary.get("field_name") or "").strip()
+    field_type = int(primary.get("type", 1))
+    if not field_id:
+        return
+    if field_name != "标题":
+        client.update_field(app_token, table_id, field_id, field_name="标题", field_type=field_type)
+
+
 def ensure_fields(client: FeishuBitableClient, app_token: str, table_id: str) -> dict[str, int]:
+    ensure_primary_title_field(client, app_token, table_id)
     fields = client.list_fields(app_token, table_id)
     by_name = {str(f.get("field_name", "")).strip(): f for f in fields if f.get("field_name")}
 
-    for field_name, field_type in REQUIRED_FIELDS:
+    for field_name, field_type, property_data in REQUIRED_FIELDS:
         if field_name not in by_name:
-            created = client.create_field(app_token, table_id, field_name, field_type)
+            created = client.create_field_with_property(app_token, table_id, field_name, field_type, property_data)
             by_name[field_name] = created
+        else:
+            existing = by_name[field_name]
+            existing_type = int(existing.get("type", 1))
+            field_id = str(existing.get("field_id") or "")
+            needs_update = (existing_type != field_type) or (field_name in {"所属平台", "状态"})
+            if needs_update and field_id:
+                client.update_field(
+                    app_token,
+                    table_id,
+                    field_id,
+                    field_name=field_name,
+                    field_type=field_type,
+                    property_data=property_data,
+                )
+    # Re-read to get latest types after updates.
+    fields = client.list_fields(app_token, table_id)
+    by_name = {str(f.get("field_name", "")).strip(): f for f in fields if f.get("field_name")}
 
     resolved: dict[str, int] = {}
-    for field_name, _ in REQUIRED_FIELDS:
+    for field_name, _, _ in REQUIRED_FIELDS:
         f = by_name.get(field_name) or {}
         resolved[field_name] = int(f.get("type", 1))
     return resolved
+
+
+def cleanup_default_empty_tables(client: FeishuBitableClient, app_token: str, *, force: bool = False) -> list[str]:
+    removed: list[str] = []
+    all_tables = client.list_tables(app_token)
+    keep = set(TABLE_DISPLAY_NAMES.values())
+    for aliases in TABLE_NAME_ALIASES.values():
+        keep.update(aliases)
+    for t in all_tables:
+        name = str(t.get("name", "")).strip()
+        table_id = str(t.get("table_id", "")).strip()
+        if not name or not table_id:
+            continue
+        if name in keep:
+            continue
+        if name not in DEFAULT_GARBAGE_TABLE_NAMES:
+            continue
+        records = client.list_records(app_token, table_id)
+        if records and not force:
+            continue
+        client.delete_table(app_token, table_id)
+        removed.append(name)
+    return removed
+
+
+def _parse_share_member_text(text: str) -> dict[str, str] | None:
+    raw = text.strip()
+    if not raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) < 2:
+        return None
+    member_type = parts[0].strip().lower()
+    member_id = parts[1].strip()
+    perm = (parts[2].strip().lower() if len(parts) >= 3 else "full_access")
+    if not member_type or not member_id:
+        return None
+    return {"member_type": member_type, "member_id": member_id, "perm": perm}
+
+
+def resolve_share_members(args: argparse.Namespace, feishu_cfg: dict[str, Any]) -> list[dict[str, str]]:
+    members: list[dict[str, str]] = []
+
+    for x in args.share_member:
+        item = _parse_share_member_text(x)
+        if item:
+            members.append(item)
+
+    cfg_list = feishu_cfg.get("share_members")
+    if isinstance(cfg_list, list):
+        for item in cfg_list:
+            if isinstance(item, str):
+                parsed = _parse_share_member_text(item)
+                if parsed:
+                    members.append(parsed)
+            elif isinstance(item, dict):
+                member_type = str(item.get("member_type") or item.get("type") or "").strip().lower()
+                member_id = str(item.get("member_id") or item.get("id") or "").strip()
+                perm = str(item.get("perm") or "full_access").strip().lower()
+                if member_type and member_id:
+                    members.append({"member_type": member_type, "member_id": member_id, "perm": perm})
+
+    owner_email = str(
+        args.owner_email
+        or feishu_cfg.get("owner_email")
+        or feishu_cfg.get("user_email")
+        or feishu_cfg.get("editor_email")
+        or ""
+    ).strip()
+    if not owner_email:
+        owner_email = str(os.getenv("FAVORITESHUB_OWNER_EMAIL", "")).strip()
+    if not owner_email:
+        owner_email = str(os.getenv("FEISHU_USER_EMAIL", "")).strip()
+    if owner_email:
+        members.append({"member_type": "email", "member_id": owner_email, "perm": "full_access"})
+
+    # de-dup
+    uniq: dict[str, dict[str, str]] = {}
+    for m in members:
+        key = f"{m['member_type']}::{m['member_id']}"
+        uniq[key] = m
+    return list(uniq.values())
+
+
+def ensure_share_members(client: FeishuBitableClient, app_token: str, members: list[dict[str, str]]) -> list[dict[str, str]]:
+    granted: list[dict[str, str]] = []
+    for m in members:
+        client.add_permission_member(
+            app_token,
+            member_id=m["member_id"],
+            member_type=m["member_type"],
+            perm=m["perm"],
+            file_type="bitable",
+        )
+        granted.append(m)
+    return granted
 
 
 def main() -> None:
@@ -104,6 +292,12 @@ def main() -> None:
 
     if app_token:
         app_meta: dict[str, Any] = {"app_token": app_token}
+        try:
+            updated = client.update_app_name(app_token, args.name)
+            if isinstance(updated, dict) and updated:
+                app_meta.update(updated)
+        except Exception:
+            pass
     else:
         app = client.create_app(args.name, folder_token or None)
         app_token = str(app.get("app_token", "")).strip()
@@ -111,9 +305,18 @@ def main() -> None:
             raise RuntimeError("创建多维表格失败：未返回 app_token")
         app_meta = app
 
+    removed_tables = cleanup_default_empty_tables(client, app_token, force=args.cleanup_force)
     tables = ensure_tables(client, app_token)
     for name, info in tables.items():
         info["fields"] = ensure_fields(client, app_token, info["table_id"])
+    share_members = resolve_share_members(args, feishu_cfg)
+    if not share_members and not args.allow_bot_only:
+        raise RuntimeError(
+            "缺少真实用户编辑权限配置。请至少提供一种："
+            "--owner-email / --share-member / feishu.owner_email / FAVORITESHUB_OWNER_EMAIL；"
+            "如确需仅机器人可编辑，请显式添加 --allow-bot-only。"
+        )
+    granted_members = ensure_share_members(client, app_token, share_members) if share_members else []
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,10 +326,24 @@ def main() -> None:
         "app_name": app_meta.get("name", args.name),
         "app_url": app_meta.get("url"),
         "tables": tables,
+        "removed_tables": removed_tables,
+        "granted_members": granted_members,
     }
     out_path.write_text(json.dumps(out_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(json.dumps({"ok": True, "out": str(out_path), "app_token": app_token, "tables": list(tables.keys())}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "out": str(out_path),
+                "app_token": app_token,
+                "tables": list(tables.keys()),
+                "removed_tables": removed_tables,
+                "granted_members": granted_members,
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

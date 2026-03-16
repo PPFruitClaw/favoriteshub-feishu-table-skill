@@ -3,13 +3,14 @@
 ## 已可直接采集
 
 - `GitHub`：使用 `gh api graphql` 获取 starred repositories，含 `stargazerCount`。
-- `X`：使用 `openclaw browser` 访问书签页并抽取 `status` 链接与正文摘要。
-- `Douyin`：可通过浏览器探测收藏页；未登录时返回 `needs_login`，已登录可抽取视频链接。
+- `X`：使用 `openclaw browser` 访问书签页并抽取 `status` 链接、正文摘要与互动计数（可解析时）。
+- `Douyin`：可通过浏览器探测收藏页；未登录时返回 `needs_login`，已登录可抽取视频链接与计数（可解析时）。
 
 ## 当前受限
 
 - `Xiaohongshu`：已通过 `openclaw browser` 实现收藏页抓取（`collect_xhs_favorites.sh`），不再启动独立浏览器。
   - 依赖用户在当前 `openclaw browser` 会话中保持登录态。
+  - 收藏页计数通过页面文本与选择器启发式提取，页面结构变化时可能失效。
   - 页面结构变化时可能需要调整选择器。
 
 ## 飞书写入能力

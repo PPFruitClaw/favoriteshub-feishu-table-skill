@@ -143,6 +143,50 @@ TAB_JSON="$(oc_eval "$PROFILE_ID" "$CLICK_TAB_JS")"
 
 EXTRACT_JS="$(cat <<'EOF'
 () => {
+  const parseCompact = (raw) => {
+    const text = (raw || '').replace(/,/g, '').trim();
+    if (!text) return null;
+    const m = text.match(/^([0-9]+(?:\.[0-9]+)?)\s*([kKmMwW万亿]?)$/);
+    if (!m) return null;
+    const base = Number(m[1]);
+    if (!Number.isFinite(base)) return null;
+    const unit = (m[2] || '').toLowerCase();
+    let factor = 1;
+    if (unit === 'k') factor = 1000;
+    else if (unit === 'm') factor = 1000000;
+    else if (unit === 'w' || unit === '万') factor = 10000;
+    else if (unit === '亿') factor = 100000000;
+    const out = Math.round(base * factor);
+    if (!Number.isFinite(out) || out < 0 || out > 1000000000) return null;
+    return out;
+  };
+
+  const pickCountFromCard = (card) => {
+    const candidateNodes = [
+      ...card.querySelectorAll('[class*="like"], [class*="collect"], [class*="count"], [data-count], span')
+    ].slice(0, 120);
+    for (const node of candidateNodes) {
+      const t = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 20) continue;
+      const m = t.match(/([0-9]+(?:\.[0-9]+)?\s*[kKmMwW万亿]?)/);
+      if (!m) continue;
+      const n = parseCompact(m[1]);
+      if (n !== null) return n;
+    }
+
+    const lines = (card.innerText || '')
+      .split('\n')
+      .map((x) => x.trim())
+      .filter((x) => x && x.length <= 20);
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const m = lines[i].match(/^([0-9]+(?:\.[0-9]+)?\s*[kKmMwW万亿]?)$/);
+      if (!m) continue;
+      const n = parseCompact(m[1]);
+      if (n !== null) return n;
+    }
+    return null;
+  };
+
   const normalize = (href) => {
     if (!href) return '';
     try {
@@ -164,7 +208,8 @@ EXTRACT_JS="$(cat <<'EOF'
     seen.add(link);
     const card = a.closest('section,article,div') || a.parentElement || a;
     const summary = (card?.innerText || a.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 300);
-    records.push({ link, summary });
+    const favoriteOrStarCount = pickCountFromCard(card);
+    records.push({ link, summary, favorite_or_star_count: favoriteOrStarCount });
   }
 
   const pageText = (document.body?.innerText || '').slice(0, 2000);
@@ -314,9 +359,10 @@ echo "$LAST_EXTRACT" | jq \
   records: [
     $records[]? | {
       platform: "xiaohongshu",
+      title: ((.summary // "") | gsub("\\s+"; " ") | .[0:40]),
       link: .link,
       summary: (.summary // ""),
-      favorite_or_star_count: null,
+      favorite_or_star_count: (.favorite_or_star_count // null),
       ingested_at: $now
     }
   ]

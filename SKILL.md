@@ -14,13 +14,16 @@ metadata:
 # FavoritesHub-FeishuTable
 
 将多平台收藏内容聚合到飞书多维表格。  
-本技能优先复用现有能力：`github`、`xiaohongshu-skills`、`DeepReader`、`openclaw browser`、`feishu_bitable_*`。
+本技能优先复用现有能力：`github`、`xiaohongshu-skills`、`openclaw browser`、`feishu_bitable_*`。
 
 ## 适用范围
 
-- 平台：`github`、`x`、`xiaohongshu`、`douyin`、`other`
+- 平台键：`github`、`x`、`xiaohongshu`、`douyin`、`other`
+- 子表展示名：`github`、`x`、`小红书`、`抖音`、`other`
 - 字段固定为：
+  - `标题`
   - `所属平台`
+  - `状态`
   - `链接`
   - `内容梗概`
   - `收藏或星标数量`
@@ -48,7 +51,10 @@ metadata:
 1. 初始化飞书多维表格（自动）：
    - 运行 `scripts/init_feishu_bitable.py`。
    - 若未提供 `app_token`，脚本会自动创建新多维表格。
-   - 自动确保 5 个子表（`github/x/xiaohongshu/douyin/other`）和固定字段存在。
+   - 自动确保 5 个子表（`github/x/小红书/抖音/other`）和固定字段存在。
+   - 自动把主字段重命名为 `标题`，`所属平台/状态` 设为单选。
+   - 自动清理默认空白子表（如 `数据表/表格1`）。
+   - 默认要求配置真实用户可编辑权限（`--owner-email` / `feishu.owner_email` / `--share-member`）。
 2. 初始化结果会写入 `output/feishu-target.json`（后续同步复用）。
 
 ### 2) 同步（常规执行）
@@ -69,12 +75,16 @@ metadata:
    - 默认 `create-only`：已存在跳过，不重复写入
    - 可切换 `create-or-update`：已存在则更新
    - 不存在：创建新记录
+   - 新记录默认 `状态=未学习`（更新记录不覆盖既有状态）
+   - `内容梗概` 默认走 LLM 中文概括（不照抄原文，且避免“该仓库/该收藏”开头）
+   - 摘要结果自动缓存到 `output/summary-cache.json`，减少重复调用
+   - `收藏或星标数量` 按整数写入，GitHub/X/小红书/抖音若采集到均会写入
 
 ### 3) 临时链接入库（other）
 
 1. 接收用户给出的任意链接（非四大平台）。
-2. 使用 `DeepReader` 抽取内容并生成梗概。
-3. 调用 `scripts/add_other_link_record.sh <url> \"<summary>\"` 生成/更新 `output/other-links.json`。
+2. 由 OpenClaw 自动读取链接内容并生成初始摘要（可选手工覆盖）。
+3. 调用 `scripts/add_other_link_record.sh <url> \"<summary>\"` 生成/更新 `output/other-links.json`（`<summary>` 可省略）。
 4. 写入 `other` 子表：
    - `所属平台=other`
    - `链接=<url>`
@@ -89,7 +99,7 @@ metadata:
 ./scripts/run_phase2_probes.sh
 
 # 初始化飞书目标（首次）
-python3 ./scripts/init_feishu_bitable.py
+python3 ./scripts/init_feishu_bitable.py --owner-email "you@example.com"
 
 # 初始化（显式指定配置文件）
 python3 ./scripts/init_feishu_bitable.py --config ./favoriteshub.config.json
@@ -97,11 +107,20 @@ python3 ./scripts/init_feishu_bitable.py --config ./favoriteshub.config.json
 # 初始化（显式传入凭据）
 python3 ./scripts/init_feishu_bitable.py --app-id "cli_xxx" --app-secret "sec_xxx"
 
+# 初始化并自动授权协作者（示例）
+python3 ./scripts/init_feishu_bitable.py --share-member "email:you@example.com:full_access"
+
+# 初始化并绑定真实用户编辑权限（推荐）
+python3 ./scripts/init_feishu_bitable.py --owner-email "you@example.com"
+
 # 同步 payload 到飞书
 python3 ./scripts/sync_payload_to_feishu.py
 
 # 同步（显式指定配置文件）
 python3 ./scripts/sync_payload_to_feishu.py --config ./favoriteshub.config.json
+
+# 同步（显式指定摘要模型配置）
+python3 ./scripts/sync_payload_to_feishu.py --summary-model "gpt-4o-mini"
 
 # 一键全流程（无 target 时会自动初始化）
 ./scripts/sync_all_to_feishu.sh
@@ -127,6 +146,8 @@ COLLECT_LIMIT=100 ./scripts/run_phase2_probes.sh
 - `x` 未登录：`collect_x_bookmarks.sh` 会输出 `requires_login=true`，跳过写入该平台。
 - `xiaohongshu` 未登录：`collect_xhs_favorites.sh` 输出 `status=needs_login`，在当前 `openclaw browser` 窗口登录后重试。
 - `douyin` 未登录：输出 `status=needs_login`，等待用户登录后重试。
+- 未配置摘要 API key：自动切换规则摘要兜底，不阻塞写入。
+- 未配置真实用户权限：`init_feishu_bitable.py` 默认会报错并提示补齐 `owner_email/share_members`（可用 `--allow-bot-only` 强制跳过）。
 - 飞书写入失败：保留 payload 与 target 配置，不丢弃采集结果，允许重放写入。
 
 ## 约束

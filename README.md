@@ -17,18 +17,30 @@
 - 默认增量写入（只新增，避免重复）
 - 采集侧支持“首次全量、后续命中边界即停止”
 - 支持跨环境配置兜底（CLI 参数 / 环境变量 / 用户配置文件 / OpenClaw 配置）
+- `内容梗概` 默认使用 LLM 生成中文概括（缓存复用，失败自动兜底）
+- 默认要求配置真实飞书用户编辑权限（owner_email/share_members）
+
+默认初始化结果：
+- 多维表名称：`FavoritesHub-多平台收藏中心`
+- 子表：`github`、`x`、`小红书`、`抖音`、`other`
 
 统一字段：
+- 标题（主字段，多行文本）
 - 所属平台
+- 状态（单选：已学习/已过期/未学习，默认未学习）
 - 链接
 - 内容梗概
 - 收藏或星标数量
 - 收录时间
 
+数量字段说明：
+- `收藏或星标数量` 使用整数写入
+- GitHub / X / 小红书 / 抖音若采集到数量均会写入，不再仅限 GitHub
+
 快速开始：
 ```bash
 # 1) 初始化飞书多维表（首次）
-python3 ./scripts/init_feishu_bitable.py
+python3 ./scripts/init_feishu_bitable.py --owner-email "you@example.com"
 
 # 2) 采集并合并 payload
 ./scripts/run_phase2_probes.sh
@@ -65,18 +77,30 @@ Key capabilities:
 - Incremental sync by default (`create-only`) to avoid duplicates
 - Collector strategy: full scan on first run, boundary-stop on subsequent runs
 - Multi-environment config fallback (CLI args / env vars / user config / OpenClaw config)
+- `Summary` is generated in Chinese by LLM by default (with cache + fallback)
+- Requires a real Feishu user editor permission by default (owner_email/share_members)
+
+Default first-run shape:
+- Bitable name: `FavoritesHub-多平台收藏中心`
+- Sub-tables: `github`, `x`, `小红书`, `抖音`, `other`
 
 Unified fields:
+- Title (primary)
 - Platform
+- Status (single select: 未学习/已学习/已过期; default 未学习)
 - Link
 - Summary
 - Favorite/Star Count
 - Ingested Time
 
+Count behavior:
+- `Favorite/Star Count` is stored as integer
+- If available, GitHub/X/Xiaohongshu/Douyin counts are all written (not GitHub-only)
+
 Quick start:
 ```bash
 # 1) Initialize Feishu target (first time)
-python3 ./scripts/init_feishu_bitable.py
+python3 ./scripts/init_feishu_bitable.py --owner-email "you@example.com"
 
 # 2) Collect and merge payload
 ./scripts/run_phase2_probes.sh
