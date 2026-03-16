@@ -1,0 +1,95 @@
+# FavoritesHub-FeishuTable
+
+## 中文说明
+
+`FavoritesHub-FeishuTable` 是一个 OpenClaw Skill，用于把多个平台的收藏内容聚合到飞书多维表格。
+
+支持平台：
+- 抖音（Douyin）
+- 小红书（Xiaohongshu）
+- X（Twitter）
+- GitHub（Stars）
+- 其他链接（手动补充）
+
+核心能力：
+- 自动初始化飞书多维表（含平台子表与统一字段）
+- 按平台采集收藏/星标内容并合并为统一 payload
+- 默认增量写入（只新增，避免重复）
+- 采集侧支持“首次全量、后续命中边界即停止”
+- 支持跨环境配置兜底（CLI 参数 / 环境变量 / 用户配置文件 / OpenClaw 配置）
+
+统一字段：
+- 所属平台
+- 链接
+- 内容梗概
+- 收藏或星标数量
+- 收录时间
+
+快速开始：
+```bash
+# 1) 初始化飞书多维表（首次）
+python3 ./scripts/init_feishu_bitable.py
+
+# 2) 采集并合并 payload
+./scripts/run_phase2_probes.sh
+
+# 3) 同步到飞书
+python3 ./scripts/sync_payload_to_feishu.py
+```
+
+可选一键流程：
+```bash
+./scripts/sync_all_to_feishu.sh
+```
+
+注意：
+- 本仓库默认不提交 `output/` 运行产物与本地凭据。
+- 使用前请按 `references/favoriteshub-config.example.json` 配置飞书凭据。
+
+---
+
+## English
+
+`FavoritesHub-FeishuTable` is an OpenClaw Skill that aggregates favorites/bookmarks/starred items from multiple platforms into Feishu Bitable.
+
+Supported sources:
+- Douyin
+- Xiaohongshu
+- X (Twitter)
+- GitHub Stars
+- Manual "Other" links
+
+Key capabilities:
+- Auto-initialize Feishu Bitable (platform sub-tables + unified schema)
+- Collect per-platform favorites/stars and merge into one payload
+- Incremental sync by default (`create-only`) to avoid duplicates
+- Collector strategy: full scan on first run, boundary-stop on subsequent runs
+- Multi-environment config fallback (CLI args / env vars / user config / OpenClaw config)
+
+Unified fields:
+- Platform
+- Link
+- Summary
+- Favorite/Star Count
+- Ingested Time
+
+Quick start:
+```bash
+# 1) Initialize Feishu target (first time)
+python3 ./scripts/init_feishu_bitable.py
+
+# 2) Collect and merge payload
+./scripts/run_phase2_probes.sh
+
+# 3) Sync to Feishu
+python3 ./scripts/sync_payload_to_feishu.py
+```
+
+Optional one-command flow:
+```bash
+./scripts/sync_all_to_feishu.sh
+```
+
+Notes:
+- Runtime artifacts and local credentials are excluded by default (`output/`, local config).
+- Configure Feishu credentials using `references/favoriteshub-config.example.json`.

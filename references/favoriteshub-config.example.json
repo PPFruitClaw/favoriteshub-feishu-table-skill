@@ -1,0 +1,9 @@
+{
+  "feishu": {
+    "app_id": "cli_xxx",
+    "app_secret": "xxxxxxxxxxxxxxxx",
+    "base_url": "https://open.feishu.cn",
+    "app_token": "",
+    "folder_token": ""
+  }
+}

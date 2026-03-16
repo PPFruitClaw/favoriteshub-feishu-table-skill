@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Feishu Bitable API helpers for FavoritesHub skill."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+class FeishuApiError(RuntimeError):
+    """Raised when Feishu OpenAPI returns non-zero code."""
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso_to_ms(value: str | None) -> int:
+    if not value:
+        return int(datetime.now(timezone.utc).timestamp() * 1000)
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _normalize_domain(raw: str | None) -> str:
+    if not raw:
+        return "https://open.feishu.cn"
+    val = raw.strip().rstrip("/")
+    if not val:
+        return "https://open.feishu.cn"
+    low = val.lower()
+    if low in {"feishu", "cn", "china"}:
+        return "https://open.feishu.cn"
+    if low in {"lark", "intl", "international"}:
+        return "https://open.larksuite.com"
+    # Some OpenClaw channel configs use logical labels (e.g. "feishu") instead of hostnames.
+    if "." not in val and "://" not in val:
+        return "https://open.feishu.cn"
+    if val.startswith("http://") or val.startswith("https://"):
+        return val
+    return f"https://{val}"
+
+
+def load_user_config(config_path: str | None = None) -> dict[str, Any]:
+    """Load optional user config for cross-environment compatibility."""
+    candidates: list[Path] = []
+    if config_path:
+        candidates.append(Path(config_path))
+    env_cfg = os.getenv("FAVORITESHUB_CONFIG", "").strip()
+    if env_cfg:
+        candidates.append(Path(env_cfg))
+    candidates.extend(
+        [
+            Path.cwd() / "favoriteshub.config.json",
+            Path.home() / ".openclaw" / "favoriteshub.config.json",
+        ]
+    )
+    for p in candidates:
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+    return {}
+
+
+def _load_openclaw_feishu_config() -> dict[str, Any]:
+    config_path = os.getenv("OPENCLAW_CONFIG_PATH", str(Path.home() / ".openclaw" / "openclaw.json"))
+    p = Path(config_path)
+    if not p.is_file():
+        return {}
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return (((cfg.get("channels") or {}).get("feishu")) or {})
+
+
+def _pick_nonempty(*values: str) -> str:
+    for v in values:
+        s = (v or "").strip()
+        if s:
+            return s
+    return ""
+
+
+def _resolve_cfg_value(cfg: dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        if k in cfg:
+            val = _resolve_secret_like(cfg.get(k))
+            if val:
+                return val
+    return ""
+
+
+def load_feishu_credentials(
+    *,
+    config: dict[str, Any] | None = None,
+    override_app_id: str = "",
+    override_app_secret: str = "",
+    override_base_url: str = "",
+) -> tuple[str, str, str]:
+    """Resolve Feishu credentials with fallback priority.
+
+    Priority (high -> low):
+    1) explicit overrides (--app-id/--app-secret/--base-url)
+    2) environment (FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_BASE_URL)
+    3) user config file (favoriteshub.config.json / FAVORITESHUB_CONFIG)
+    4) OpenClaw config (channels.feishu.*)
+    5) defaults (base_url only)
+    """
+    user_cfg = config or {}
+    user_feishu_cfg = ((user_cfg.get("feishu") or {}) if isinstance(user_cfg, dict) else {})
+    oc_feishu_cfg = _load_openclaw_feishu_config()
+
+    app_id = _pick_nonempty(
+        override_app_id,
+        _get_env_or_dotenv("FEISHU_APP_ID"),
+        _resolve_cfg_value(user_feishu_cfg, "app_id", "appId"),
+        _resolve_cfg_value(oc_feishu_cfg, "appId"),
+    )
+    app_secret = _pick_nonempty(
+        override_app_secret,
+        _get_env_or_dotenv("FEISHU_APP_SECRET"),
+        _resolve_cfg_value(user_feishu_cfg, "app_secret", "appSecret"),
+        _resolve_cfg_value(oc_feishu_cfg, "appSecret"),
+    )
+    base_url = _pick_nonempty(
+        override_base_url,
+        os.getenv("FEISHU_BASE_URL", "").strip(),
+        _resolve_cfg_value(user_feishu_cfg, "base_url", "baseUrl", "domain"),
+        _resolve_cfg_value(oc_feishu_cfg, "domain"),
+    )
+
+    if not app_id or not app_secret:
+        raise RuntimeError(
+            "缺少飞书凭据。可选兜底方式："
+            "1) 命令行 --app-id/--app-secret；"
+            "2) 环境变量 FEISHU_APP_ID/FEISHU_APP_SECRET；"
+            "3) 配置文件 favoriteshub.config.json（或 FAVORITESHUB_CONFIG 指向它）；"
+            "4) OpenClaw 配置 channels.feishu.appId/appSecret。"
+        )
+    return app_id, app_secret, _normalize_domain(base_url)
+
+
+def _resolve_secret_like(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        # ${ENV_NAME}
+        m = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", text)
+        if m:
+            return _get_env_or_dotenv(m.group(1))
+        # $ENV_NAME
+        m2 = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)", text)
+        if m2:
+            return _get_env_or_dotenv(m2.group(1))
+        return text
+    if isinstance(value, dict):
+        source = str(value.get("source", "")).strip().lower()
+        if source == "env":
+            key = str(value.get("id", "")).strip()
+            return _get_env_or_dotenv(key) if key else ""
+        # Unknown secret source in standalone scripts: treat as unresolved.
+        return ""
+    return str(value).strip()
+
+
+_DOTENV_CACHE: dict[str, str] | None = None
+
+
+def _load_dotenv_map() -> dict[str, str]:
+    global _DOTENV_CACHE
+    if _DOTENV_CACHE is not None:
+        return _DOTENV_CACHE
+    result: dict[str, str] = {}
+    candidates = [
+        os.getenv("OPENCLAW_ENV_PATH", "").strip(),
+        str(Path.home() / ".openclaw" / ".env"),
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        p = Path(path)
+        if not p.is_file():
+            continue
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                key = k.strip()
+                val = v.strip().strip('"').strip("'")
+                if key and key not in result:
+                    result[key] = val
+        except OSError:
+            pass
+    _DOTENV_CACHE = result
+    return result
+
+
+def _get_env_or_dotenv(key: str) -> str:
+    val = os.getenv(key, "").strip()
+    if val:
+        return val
+    return _load_dotenv_map().get(key, "").strip()
+
+
+def _http_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    data: dict[str, Any] | None = None,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    req_headers = {"Content-Type": "application/json; charset=utf-8"}
+    if headers:
+        req_headers.update(headers)
+    body = None if data is None else json.dumps(data, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url=url, data=body, headers=req_headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code} {url}: {raw}") from e
+
+
+class FeishuBitableClient:
+    def __init__(self, app_id: str, app_secret: str, base_url: str):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.base_url = base_url.rstrip("/")
+        self._tenant_token: str | None = None
+
+    def _url(self, path: str, params: dict[str, Any] | None = None) -> str:
+        base = f"{self.base_url}{path}"
+        if not params:
+            return base
+        query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+        return f"{base}?{query}" if query else base
+
+    def _auth_headers(self) -> dict[str, str]:
+        if not self._tenant_token:
+            self._tenant_token = self.get_tenant_access_token()
+        return {"Authorization": f"Bearer {self._tenant_token}"}
+
+    @staticmethod
+    def _ensure_ok(payload: dict[str, Any], api_name: str) -> dict[str, Any]:
+        code = payload.get("code")
+        if code not in (0, "0", None):
+            msg = payload.get("msg") or payload.get("message") or "unknown error"
+            raise FeishuApiError(f"{api_name} failed: code={code}, msg={msg}")
+        return payload
+
+    def get_tenant_access_token(self) -> str:
+        url = self._url("/open-apis/auth/v3/tenant_access_token/internal")
+        data = {"app_id": self.app_id, "app_secret": self.app_secret}
+        payload = self._ensure_ok(_http_json("POST", url, data=data), "tenant_access_token")
+        token = payload.get("tenant_access_token")
+        if not token:
+            raise FeishuApiError("tenant_access_token missing in response")
+        return str(token)
+
+    def create_app(self, name: str, folder_token: str | None = None) -> dict[str, Any]:
+        url = self._url("/open-apis/bitable/v1/apps")
+        data: dict[str, Any] = {"name": name}
+        if folder_token:
+            data["folder_token"] = folder_token
+        payload = self._ensure_ok(
+            _http_json("POST", url, headers=self._auth_headers(), data=data),
+            "bitable.app.create",
+        )
+        return (payload.get("data") or {}).get("app") or {}
+
+    def list_tables(self, app_token: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            url = self._url(
+                f"/open-apis/bitable/v1/apps/{app_token}/tables",
+                {"page_size": 100, "page_token": page_token},
+            )
+            payload = self._ensure_ok(
+                _http_json("GET", url, headers=self._auth_headers()),
+                "bitable.appTable.list",
+            )
+            data = payload.get("data") or {}
+            items.extend(data.get("items") or [])
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token")
+            if not page_token:
+                break
+        return items
+
+    def create_table(self, app_token: str, name: str) -> dict[str, Any]:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables")
+        payload = self._ensure_ok(
+            _http_json("POST", url, headers=self._auth_headers(), data={"table": {"name": name}}),
+            "bitable.appTable.create",
+        )
+        return (payload.get("data") or {}).get("table") or {}
+
+    def list_fields(self, app_token: str, table_id: str) -> list[dict[str, Any]]:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields", {"page_size": 500})
+        payload = self._ensure_ok(
+            _http_json("GET", url, headers=self._auth_headers()),
+            "bitable.appTableField.list",
+        )
+        return (payload.get("data") or {}).get("items") or []
+
+    def create_field(self, app_token: str, table_id: str, field_name: str, field_type: int) -> dict[str, Any]:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields")
+        payload = self._ensure_ok(
+            _http_json(
+                "POST",
+                url,
+                headers=self._auth_headers(),
+                data={"field_name": field_name, "type": field_type},
+            ),
+            "bitable.appTableField.create",
+        )
+        return (payload.get("data") or {}).get("field") or {}
+
+    def list_records(self, app_token: str, table_id: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            url = self._url(
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                {"page_size": 500, "page_token": page_token, "automatic_fields": "true"},
+            )
+            payload = self._ensure_ok(
+                _http_json("GET", url, headers=self._auth_headers()),
+                "bitable.appTableRecord.list",
+            )
+            data = payload.get("data") or {}
+            items.extend(data.get("items") or [])
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token")
+            if not page_token:
+                break
+        return items
+
+    def create_record(self, app_token: str, table_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records")
+        payload = self._ensure_ok(
+            _http_json("POST", url, headers=self._auth_headers(), data={"fields": fields}),
+            "bitable.appTableRecord.create",
+        )
+        return (payload.get("data") or {}).get("record") or {}
+
+    def update_record(self, app_token: str, table_id: str, record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        url = self._url(f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}")
+        payload = self._ensure_ok(
+            _http_json("PUT", url, headers=self._auth_headers(), data={"fields": fields}),
+            "bitable.appTableRecord.update",
+        )
+        return (payload.get("data") or {}).get("record") or {}

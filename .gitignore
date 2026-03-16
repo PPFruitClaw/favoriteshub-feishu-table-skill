@@ -1,0 +1,14 @@
+# Runtime output and local state
+output/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local env/config secrets
+.env
+*.env
+favoriteshub.config.json
+
+# macOS
+.DS_Store
