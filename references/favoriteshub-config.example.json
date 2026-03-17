@@ -8,6 +8,8 @@
     "owner_email": "",
     "transfer_owner": true,
     "transfer_owner_email": "",
+    "transfer_owner_member_id": "",
+    "transfer_owner_member_type": "openid",
     "share_members": []
   }
 }

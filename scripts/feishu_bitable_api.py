@@ -483,12 +483,51 @@ class FeishuBitableClient:
             raise last_err
         raise FeishuApiError("add_permission_member failed")
 
+    def batch_get_user_ids_by_emails(self, emails: list[str], *, user_id_type: str = "open_id") -> list[dict[str, Any]]:
+        """Resolve user IDs from emails via Contact API.
+
+        user_id_type: open_id / user_id / union_id
+        """
+        normalized = [str(x).strip() for x in emails if str(x).strip()]
+        if not normalized:
+            return []
+        url = self._url(
+            "/open-apis/contact/v3/users/batch_get_id",
+            {"user_id_type": user_id_type},
+        )
+        payload = self._ensure_ok(
+            _http_json(
+                "POST",
+                url,
+                headers=self._auth_headers(),
+                data={"emails": normalized},
+            ),
+            "contact.user.batch_get_id",
+        )
+        data = payload.get("data") or {}
+        return data.get("user_list") or []
+
+    def resolve_user_id_by_email(self, email: str, *, user_id_type: str = "open_id") -> str:
+        e = str(email or "").strip()
+        if not e:
+            return ""
+        items = self.batch_get_user_ids_by_emails([e], user_id_type=user_id_type)
+        if not items:
+            return ""
+        for item in items:
+            em = str(item.get("email") or "").strip().lower()
+            uid = str(item.get("user_id") or "").strip()
+            if em == e.lower() and uid:
+                return uid
+        uid = str((items[0] or {}).get("user_id") or "").strip()
+        return uid
+
     def transfer_permission_owner(
         self,
         token: str,
         *,
         member_id: str,
-        member_type: str = "email",
+        member_type: str = "openid",
         file_type: str = "bitable",
     ) -> dict[str, Any]:
         """Transfer file ownership to target member.
@@ -496,12 +535,38 @@ class FeishuBitableClient:
         Feishu/Lark API variants differ across versions, so this method tries
         multiple compatible endpoints/methods and returns first success.
         """
-        params = {"type": file_type}
+        member_type_normalized = str(member_type or "").strip().lower()
+        if member_type_normalized in {"open_id", "openid", "open-id"}:
+            member_type_normalized = "openid"
+        elif member_type_normalized in {"user_id", "userid", "user-id"}:
+            member_type_normalized = "userid"
+        elif member_type_normalized in {"union_id", "unionid", "union-id"}:
+            member_type_normalized = "unionid"
+
         body = {
-            "member_id": member_id,
-            "member_type": member_type,
+            "type": file_type,
+            "token": token,
+            "owner": {
+                "member_type": member_type_normalized or "openid",
+                "member_id": member_id,
+            },
+            "remove_old_owner": False,
+            "cancel_notify": False,
         }
         last_err: Exception | None = None
+        # Preferred endpoint in newer docs.
+        try:
+            url = self._url("/open-apis/drive/permission/member/transfer")
+            payload = self._ensure_ok(
+                _http_json("POST", url, headers=self._auth_headers(), data=body),
+                "drive.permission.member.transfer",
+            )
+            return payload.get("data") or {}
+        except Exception as e:  # pragma: no cover
+            last_err = e
+
+        params = {"type": file_type}
+        legacy_body = {"member_id": member_id, "member_type": member_type_normalized or "openid"}
         for method in ("POST", "PUT"):
             for path, api_name in [
                 (f"/open-apis/drive/v1/permissions/{token}/members/transfer_owner", "drive.permission.member.transfer.v1"),
@@ -512,7 +577,7 @@ class FeishuBitableClient:
                 try:
                     url = self._url(path, params)
                     payload = self._ensure_ok(
-                        _http_json(method, url, headers=self._auth_headers(), data=body),
+                        _http_json(method, url, headers=self._auth_headers(), data=legacy_body),
                         api_name,
                     )
                     return (payload.get("data") or {}).get("member") or {}

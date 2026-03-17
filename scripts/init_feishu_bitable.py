@@ -63,6 +63,23 @@ def parse_args() -> argparse.Namespace:
         help="转移所有权目标邮箱（默认复用 owner_email）",
     )
     p.add_argument(
+        "--transfer-owner-member-id",
+        default="",
+        help="转移所有权目标 member_id（优先级高于邮箱）",
+    )
+    p.add_argument(
+        "--transfer-owner-member-type",
+        default="openid",
+        choices=["openid", "userid", "unionid", "email"],
+        help="转移所有权目标 member_id 的类型（默认 openid）",
+    )
+    p.add_argument(
+        "--transfer-owner-id-type",
+        default="open_id",
+        choices=["open_id", "user_id", "union_id"],
+        help="按邮箱解析 member_id 时返回的 ID 类型（默认 open_id）",
+    )
+    p.add_argument(
         "--share-member",
         action="append",
         default=[],
@@ -97,6 +114,11 @@ def parse_args() -> argparse.Namespace:
         "--out",
         default=str(Path(__file__).resolve().parent.parent / "output" / "feishu-target.json"),
         help="输出目标配置 JSON 路径",
+    )
+    p.add_argument(
+        "--owner-identity-cache",
+        default=str(Path(__file__).resolve().parent.parent / "output" / "owner-identity.json"),
+        help="owner 身份缓存文件（用于无感复用 member_id）",
     )
     return p.parse_args()
 
@@ -288,6 +310,48 @@ def _truthy(value: Any, default: bool = True) -> bool:
     return default
 
 
+def _normalize_member_type(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"open_id", "openid", "open-id"}:
+        return "openid"
+    if text in {"user_id", "userid", "user-id"}:
+        return "userid"
+    if text in {"union_id", "unionid", "union-id"}:
+        return "unionid"
+    if text == "email":
+        return "email"
+    return "openid"
+
+
+def load_owner_identity_cache(path: str) -> dict[str, str]:
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "member_id": str(data.get("member_id") or "").strip(),
+        "member_type": _normalize_member_type(str(data.get("member_type") or "openid")),
+        "email": str(data.get("email") or "").strip(),
+    }
+
+
+def save_owner_identity_cache(path: str, identity: dict[str, str]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    out = {
+        "member_id": str(identity.get("member_id") or "").strip(),
+        "member_type": _normalize_member_type(str(identity.get("member_type") or "openid")),
+        "email": str(identity.get("email") or "").strip(),
+        "updated_at": utc_now_iso(),
+    }
+    p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def resolve_share_members(args: argparse.Namespace, feishu_cfg: dict[str, Any]) -> list[dict[str, str]]:
     members: list[dict[str, str]] = []
 
@@ -374,23 +438,30 @@ def try_transfer_owner(
     client: FeishuBitableClient,
     app_token: str,
     *,
-    email: str,
+    member_id: str,
+    member_type: str,
+    email: str = "",
     strict: bool = False,
 ) -> dict[str, Any]:
-    member_id = str(email or "").strip()
-    if not member_id or _is_placeholder_email(member_id) or not _is_valid_email(member_id):
-        return {"attempted": False, "ok": False, "member_id": member_id, "error": "invalid_or_placeholder_email"}
+    mid = str(member_id or "").strip()
+    mtype = _normalize_member_type(member_type)
+    if not mid:
+        return {"attempted": False, "ok": False, "member_id": "", "member_type": mtype, "error": "missing_member_id"}
+    if mtype == "email" and (_is_placeholder_email(mid) or not _is_valid_email(mid)):
+        return {"attempted": False, "ok": False, "member_id": mid, "member_type": mtype, "error": "invalid_email"}
     try:
         result = client.transfer_permission_owner(
             app_token,
-            member_id=member_id,
-            member_type="email",
+            member_id=mid,
+            member_type=mtype,
             file_type="bitable",
         )
         return {
             "attempted": True,
             "ok": True,
-            "member_id": member_id,
+            "member_id": mid,
+            "member_type": mtype,
+            "email": str(email or "").strip(),
             "result": result,
         }
     except Exception as e:
@@ -399,7 +470,9 @@ def try_transfer_owner(
         return {
             "attempted": True,
             "ok": False,
-            "member_id": member_id,
+            "member_id": mid,
+            "member_type": mtype,
+            "email": str(email or "").strip(),
             "error": str(e),
         }
 
@@ -463,20 +536,78 @@ def main() -> None:
     cfg_transfer_owner = feishu_cfg.get("transfer_owner")
     transfer_owner = (not args.skip_owner_transfer) and _truthy(cfg_transfer_owner, default=True)
     transfer_owner_email = _resolve_transfer_owner_email(args, feishu_cfg)
-    owner_transfer = {"attempted": False, "ok": False, "member_id": "", "error": ""}
-    if transfer_owner and transfer_owner_email:
+    cached_owner_identity = load_owner_identity_cache(args.owner_identity_cache)
+    cfg_member_id = str(
+        feishu_cfg.get("transfer_owner_member_id")
+        or feishu_cfg.get("transferOwnerMemberId")
+        or ""
+    ).strip()
+    cfg_member_type = _normalize_member_type(
+        str(
+            feishu_cfg.get("transfer_owner_member_type")
+            or feishu_cfg.get("transferOwnerMemberType")
+            or "openid"
+        )
+    )
+
+    owner_member_id = ""
+    owner_member_type = "openid"
+    owner_identity_source = ""
+
+    if args.transfer_owner_member_id.strip():
+        owner_member_id = args.transfer_owner_member_id.strip()
+        owner_member_type = _normalize_member_type(args.transfer_owner_member_type)
+        owner_identity_source = "cli_member_id"
+    elif cfg_member_id:
+        owner_member_id = cfg_member_id
+        owner_member_type = cfg_member_type
+        owner_identity_source = "config_member_id"
+    elif cached_owner_identity.get("member_id"):
+        owner_member_id = str(cached_owner_identity.get("member_id") or "").strip()
+        owner_member_type = _normalize_member_type(cached_owner_identity.get("member_type") or "openid")
+        owner_identity_source = "cache_member_id"
+
+    if not owner_member_id and transfer_owner_email and _is_valid_email(transfer_owner_email):
+        try:
+            resolved_id = client.resolve_user_id_by_email(
+                transfer_owner_email,
+                user_id_type=args.transfer_owner_id_type,
+            )
+        except Exception:
+            resolved_id = ""
+        if resolved_id:
+            owner_member_id = resolved_id
+            owner_member_type = _normalize_member_type(args.transfer_owner_id_type)
+            owner_identity_source = "email_resolved"
+
+    owner_transfer = {"attempted": False, "ok": False, "member_id": "", "member_type": "", "error": ""}
+    if transfer_owner and owner_member_id:
         owner_transfer = try_transfer_owner(
             client,
             app_token,
+            member_id=owner_member_id,
+            member_type=owner_member_type,
             email=transfer_owner_email,
             strict=args.transfer_owner_strict,
         )
-    elif transfer_owner and not transfer_owner_email:
+        owner_transfer["source"] = owner_identity_source
+        if owner_transfer.get("ok"):
+            save_owner_identity_cache(
+                args.owner_identity_cache,
+                {
+                    "member_id": owner_member_id,
+                    "member_type": owner_member_type,
+                    "email": transfer_owner_email,
+                },
+            )
+    elif transfer_owner and not owner_member_id:
         owner_transfer = {
             "attempted": False,
             "ok": False,
             "member_id": "",
-            "error": "missing_transfer_owner_email",
+            "member_type": "",
+            "error": "missing_transfer_owner_identity",
+            "source": owner_identity_source or "none",
         }
 
     out_path = Path(args.out)
@@ -491,6 +622,7 @@ def main() -> None:
         "granted_members": granted_members,
         "failed_members": failed_members,
         "owner_transfer": owner_transfer,
+        "owner_identity_cache": args.owner_identity_cache,
     }
     out_path.write_text(json.dumps(out_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -505,6 +637,7 @@ def main() -> None:
                 "granted_members": granted_members,
                 "failed_members": failed_members,
                 "owner_transfer": owner_transfer,
+                "owner_identity_cache": args.owner_identity_cache,
             },
             ensure_ascii=False,
         )

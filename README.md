@@ -21,6 +21,7 @@
 - 默认要求配置真实飞书用户编辑权限（owner_email/share_members）
 - 授权失败默认不中断初始化，失败明细写入 `failed_members`（可用 `--share-strict` 严格模式）
 - 默认自动尝试转移文档所有权给真实用户（失败明细写入 `owner_transfer`）
+- 支持按邮箱自动解析并缓存 `member_id`（首次后可无感复用）
 
 默认初始化结果：
 - 多维表名称：`FavoritesHub-多平台收藏中心`
@@ -83,6 +84,7 @@ Key capabilities:
 - `Summary` is generated in Chinese by OpenClaw native reading/summarization by default (with cache + fallback)
 - Requires a real Feishu user editor permission by default (owner_email/share_members)
 - Ownership transfer to the real user is attempted by default (result in `owner_transfer`)
+- Owner member ID can be auto-resolved from email and cached for later no-touch runs
 
 Default first-run shape:
 - Bitable name: `FavoritesHub-多平台收藏中心`
