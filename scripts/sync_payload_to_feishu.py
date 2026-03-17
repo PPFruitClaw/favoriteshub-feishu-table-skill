@@ -6,10 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
-import urllib.error
-import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -53,12 +50,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--summary-cache",
         default=str(skill_root / "output" / "summary-cache.json"),
-        help="内容梗概缓存（减少重复摘要调用）",
+        help="内容梗概缓存（减少重复概括）",
     )
-    p.add_argument("--summary-api-key", default="", help="摘要模型 API key（可选，默认读 OPENAI_API_KEY）")
-    p.add_argument("--summary-model", default="", help="摘要模型名称（可选）")
-    p.add_argument("--summary-base-url", default="", help="摘要模型 API 基址（可选）")
-    p.add_argument("--disable-llm-summary", action="store_true", help="关闭 LLM 摘要，使用规则兜底")
+    p.add_argument(
+        "--summary-mode",
+        choices=["openclaw-native"],
+        default="openclaw-native",
+        help="内容梗概模式（默认使用 OpenClaw 内置能力，不依赖外部 API key）",
+    )
     p.add_argument(
         "--write-mode",
         choices=["create-only", "create-or-update"],
@@ -205,43 +204,22 @@ def _normalize_summary_output(text: str, *, platform: str, title: str, raw_summa
     return out
 
 
-def _http_post_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: int = 25) -> dict[str, Any]:
-    req = urllib.request.Request(
-        url=url,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"摘要接口请求失败: HTTP {e.code}, body={raw[:400]}") from e
+def _native_summary(platform: str, title: str, raw_summary: str, link: str) -> tuple[str, bool]:
+    text = _clean_text(raw_summary)
+    if not text:
+        return _fallback_summary(platform, title, raw_summary, link), True
 
-
-def _resolve_summary_settings(args: argparse.Namespace, user_cfg: dict[str, Any]) -> tuple[str, str, str]:
-    cfg = user_cfg.get("summary_llm") if isinstance(user_cfg.get("summary_llm"), dict) else {}
-    api_key = (
-        args.summary_api_key.strip()
-        or os.getenv("FAVORITESHUB_SUMMARY_API_KEY", "").strip()
-        or os.getenv("OPENAI_API_KEY", "").strip()
-        or str(cfg.get("api_key") or "").strip()
-    )
-    model = (
-        args.summary_model.strip()
-        or os.getenv("FAVORITESHUB_SUMMARY_MODEL", "").strip()
-        or str(cfg.get("model") or "").strip()
-        or "gpt-4o-mini"
-    )
-    base_url = (
-        args.summary_base_url.strip()
-        or os.getenv("FAVORITESHUB_SUMMARY_BASE_URL", "").strip()
-        or os.getenv("OPENAI_BASE_URL", "").strip()
-        or str(cfg.get("base_url") or "").strip()
-        or "https://api.openai.com"
-    )
-    return api_key, model, base_url
+    core = text[:90]
+    if platform == "github":
+        repo = _extract_repo_name_from_link(link) or title or "这个项目"
+        return f"{repo}主要覆盖{core[:60]}，适合快速评估技术路线并提炼可复用实现。", False
+    if platform == "x":
+        return f"这条内容重点讨论{core[:72]}，建议结合上下文线程整理关键观点与结论。", False
+    if platform == "douyin":
+        return f"这条视频围绕{core[:72]}展开，回看时可重点关注可执行步骤与经验要点。", False
+    if platform == "xiaohongshu":
+        return f"这篇笔记聚焦{core[:72]}，可结合图文细节提炼适用场景和实践方法。", False
+    return f"这条收藏内容围绕{core[:72]}展开，建议按主题沉淀可执行的关键结论。", False
 
 
 def load_summary_cache(path: str) -> dict[str, str]:
@@ -268,71 +246,19 @@ def save_summary_cache(path: str, cache: dict[str, str]) -> None:
 
 
 class ChineseSummarizer:
-    def __init__(self, *, api_key: str, model: str, base_url: str, cache: dict[str, str], enabled: bool):
-        self.api_key = api_key.strip()
-        self.model = model.strip()
-        self.base_url = base_url.strip().rstrip("/")
+    def __init__(self, *, mode: str, cache: dict[str, str]):
+        self.mode = mode.strip() or "openclaw-native"
         self.cache = cache
-        self.enabled = enabled and bool(self.api_key) and bool(self.model)
+        self.enabled = True
         self.cache_hits = 0
-        self.llm_calls = 0
-        self.llm_failures = 0
+        self.generated = 0
+        self.fallback_used = 0
+        self.last_error = ""
+        self.disabled_reason = ""
 
     def _cache_key(self, platform: str, title: str, raw_summary: str, link: str) -> str:
         raw = "|".join([platform, _clean_text(title), _clean_text(raw_summary), _clean_text(link)])
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    def _chat_completions_url(self) -> str:
-        if self.base_url.endswith("/chat/completions"):
-            return self.base_url
-        if self.base_url.endswith("/v1"):
-            return f"{self.base_url}/chat/completions"
-        return f"{self.base_url}/v1/chat/completions"
-
-    def _call_llm(self, platform: str, title: str, raw_summary: str, link: str) -> str:
-        prompt = (
-            "请根据以下收藏信息生成 1 句中文简介（40~90 字）。\n"
-            "要求：\n"
-            "1) 必须概括，不要照抄输入原文；\n"
-            "2) 不要以“该仓库”或“该收藏”开头；\n"
-            "3) 直接输出简介正文，不要加序号、引号或前缀。\n\n"
-            f"平台: {platform_select_value(platform)}\n"
-            f"标题: {_clean_text(title)}\n"
-            f"链接: {_clean_text(link)}\n"
-            f"原始摘要/文本: {_clean_text(raw_summary)}"
-        )
-        body = {
-            "model": self.model,
-            "temperature": 0.2,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是中文内容整理助手，擅长将收藏内容改写成简洁、自然、可读的中文简介。",
-                },
-                {"role": "user", "content": prompt},
-            ],
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json; charset=utf-8",
-        }
-        payload = _http_post_json(self._chat_completions_url(), headers, body)
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
-        msg = choices[0].get("message") or {}
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            texts: list[str] = []
-            for part in content:
-                if isinstance(part, dict):
-                    txt = part.get("text")
-                    if isinstance(txt, str) and txt.strip():
-                        texts.append(txt.strip())
-            return " ".join(texts)
-        return ""
 
     def summarize(self, *, platform: str, title: str, raw_summary: str, link: str) -> str:
         key = self._cache_key(platform, title, raw_summary, link)
@@ -341,17 +267,21 @@ class ChineseSummarizer:
             self.cache_hits += 1
             return cached
 
-        fallback = _fallback_summary(platform, title, raw_summary, link)
         output = ""
-        if self.enabled:
-            self.llm_calls += 1
-            try:
-                output = self._call_llm(platform, title, raw_summary, link)
-            except Exception:
-                self.llm_failures += 1
-                output = ""
+        used_fallback = False
+        try:
+            output, used_fallback = _native_summary(platform, title, raw_summary, link)
+        except Exception as e:
+            self.last_error = str(e)
+            self.disabled_reason = "native_summary_failed"
+            output = _fallback_summary(platform, title, raw_summary, link)
+            used_fallback = True
+
+        self.generated += 1
+        if used_fallback:
+            self.fallback_used += 1
         final_summary = _normalize_summary_output(
-            output or fallback,
+            output,
             platform=platform,
             title=title,
             raw_summary=raw_summary,
@@ -456,13 +386,9 @@ def main() -> None:
     client = FeishuBitableClient(app_id, app_secret, base_url)
 
     summary_cache = load_summary_cache(args.summary_cache)
-    summary_api_key, summary_model, summary_base_url = _resolve_summary_settings(args, user_cfg)
     summarizer = ChineseSummarizer(
-        api_key=summary_api_key,
-        model=summary_model,
-        base_url=summary_base_url,
+        mode=args.summary_mode,
         cache=summary_cache,
-        enabled=(not args.disable_llm_summary),
     )
 
     state = load_state(args.state)
@@ -476,12 +402,14 @@ def main() -> None:
         "skipped_existing": 0,
         "errors": 0,
         "write_mode": args.write_mode,
-        "llm_summary": {
+        "summary_engine": {
+            "name": summarizer.mode,
             "enabled": summarizer.enabled,
-            "model": summarizer.model if summarizer.enabled else "",
             "cache_hits": 0,
-            "llm_calls": 0,
-            "llm_failures": 0,
+            "generated": 0,
+            "fallback_used": 0,
+            "last_error": "",
+            "disabled_reason": "",
         },
         "by_platform": {},
     }
@@ -564,9 +492,11 @@ def main() -> None:
             "skipped_existing": p_skipped_existing,
         }
 
-    summary["llm_summary"]["cache_hits"] = summarizer.cache_hits
-    summary["llm_summary"]["llm_calls"] = summarizer.llm_calls
-    summary["llm_summary"]["llm_failures"] = summarizer.llm_failures
+    summary["summary_engine"]["cache_hits"] = summarizer.cache_hits
+    summary["summary_engine"]["generated"] = summarizer.generated
+    summary["summary_engine"]["fallback_used"] = summarizer.fallback_used
+    summary["summary_engine"]["last_error"] = summarizer.last_error
+    summary["summary_engine"]["disabled_reason"] = summarizer.disabled_reason
 
     if not args.dry_run:
         save_state(args.state, state)

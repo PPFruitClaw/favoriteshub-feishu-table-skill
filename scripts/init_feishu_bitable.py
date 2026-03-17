@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         "--allow-bot-only",
         action="store_true",
         help="允许仅机器人可编辑（默认关闭，建议保留真实用户编辑权限）",
+    )
+    p.add_argument(
+        "--share-strict",
+        action="store_true",
+        help="分享成员授权失败时立即报错退出（默认失败不阻塞初始化）",
     )
     p.add_argument(
         "--out",
@@ -211,6 +217,20 @@ def _parse_share_member_text(text: str) -> dict[str, str] | None:
     return {"member_type": member_type, "member_id": member_id, "perm": perm}
 
 
+def _is_placeholder_email(email: str) -> bool:
+    e = email.strip().lower()
+    if not e:
+        return False
+    return e in {"you@example.com", "example@example.com"} or e.endswith("@example.com")
+
+
+def _is_valid_email(email: str) -> bool:
+    e = email.strip()
+    if not e:
+        return False
+    return re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e) is not None
+
+
 def resolve_share_members(args: argparse.Namespace, feishu_cfg: dict[str, Any]) -> list[dict[str, str]]:
     members: list[dict[str, str]] = []
 
@@ -244,7 +264,7 @@ def resolve_share_members(args: argparse.Namespace, feishu_cfg: dict[str, Any]) 
         owner_email = str(os.getenv("FAVORITESHUB_OWNER_EMAIL", "")).strip()
     if not owner_email:
         owner_email = str(os.getenv("FEISHU_USER_EMAIL", "")).strip()
-    if owner_email:
+    if owner_email and not _is_placeholder_email(owner_email):
         members.append({"member_type": "email", "member_id": owner_email, "perm": "full_access"})
 
     # de-dup
@@ -255,18 +275,52 @@ def resolve_share_members(args: argparse.Namespace, feishu_cfg: dict[str, Any]) 
     return list(uniq.values())
 
 
-def ensure_share_members(client: FeishuBitableClient, app_token: str, members: list[dict[str, str]]) -> list[dict[str, str]]:
+def ensure_share_members(
+    client: FeishuBitableClient,
+    app_token: str,
+    members: list[dict[str, str]],
+    *,
+    strict: bool = False,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     granted: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
     for m in members:
-        client.add_permission_member(
-            app_token,
-            member_id=m["member_id"],
-            member_type=m["member_type"],
-            perm=m["perm"],
-            file_type="bitable",
-        )
-        granted.append(m)
-    return granted
+        member_type = str(m.get("member_type") or "").strip().lower()
+        member_id = str(m.get("member_id") or "").strip()
+        perm = str(m.get("perm") or "full_access").strip().lower()
+
+        if member_type == "email" and (_is_placeholder_email(member_id) or not _is_valid_email(member_id)):
+            err = {
+                "member_type": member_type,
+                "member_id": member_id,
+                "perm": perm,
+                "error": "invalid_or_placeholder_email",
+            }
+            failed.append(err)
+            if strict:
+                raise RuntimeError(f"无效邮箱：{member_id}")
+            continue
+
+        try:
+            client.add_permission_member(
+                app_token,
+                member_id=member_id,
+                member_type=member_type,
+                perm=perm,
+                file_type="bitable",
+            )
+            granted.append({"member_type": member_type, "member_id": member_id, "perm": perm})
+        except Exception as e:
+            err = {
+                "member_type": member_type,
+                "member_id": member_id,
+                "perm": perm,
+                "error": str(e),
+            }
+            failed.append(err)
+            if strict:
+                raise
+    return granted, failed
 
 
 def main() -> None:
@@ -316,7 +370,15 @@ def main() -> None:
             "--owner-email / --share-member / feishu.owner_email / FAVORITESHUB_OWNER_EMAIL；"
             "如确需仅机器人可编辑，请显式添加 --allow-bot-only。"
         )
-    granted_members = ensure_share_members(client, app_token, share_members) if share_members else []
+    granted_members: list[dict[str, str]] = []
+    failed_members: list[dict[str, str]] = []
+    if share_members:
+        granted_members, failed_members = ensure_share_members(
+            client,
+            app_token,
+            share_members,
+            strict=args.share_strict,
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,6 +390,7 @@ def main() -> None:
         "tables": tables,
         "removed_tables": removed_tables,
         "granted_members": granted_members,
+        "failed_members": failed_members,
     }
     out_path.write_text(json.dumps(out_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -340,6 +403,7 @@ def main() -> None:
                 "tables": list(tables.keys()),
                 "removed_tables": removed_tables,
                 "granted_members": granted_members,
+                "failed_members": failed_members,
             },
             ensure_ascii=False,
         )

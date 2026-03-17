@@ -10,6 +10,7 @@
   "app_url": "https://xxx.feishu.cn/base/xxxx",
   "removed_tables": ["数据表"],
   "granted_members": [{"member_type": "email", "member_id": "you@example.com", "perm": "full_access"}],
+  "failed_members": [],
   "tables": {
     "github": {
       "table_id": "tblxxxx",

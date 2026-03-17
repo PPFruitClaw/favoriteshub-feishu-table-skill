@@ -17,8 +17,9 @@
 - 默认增量写入（只新增，避免重复）
 - 采集侧支持“首次全量、后续命中边界即停止”
 - 支持跨环境配置兜底（CLI 参数 / 环境变量 / 用户配置文件 / OpenClaw 配置）
-- `内容梗概` 默认使用 LLM 生成中文概括（缓存复用，失败自动兜底）
+- `内容梗概` 默认由 OpenClaw 自主读链接并生成中文概括（缓存复用，失败自动兜底）
 - 默认要求配置真实飞书用户编辑权限（owner_email/share_members）
+- 授权失败默认不中断初始化，失败明细写入 `failed_members`（可用 `--share-strict` 严格模式）
 
 默认初始化结果：
 - 多维表名称：`FavoritesHub-多平台收藏中心`
@@ -77,7 +78,7 @@ Key capabilities:
 - Incremental sync by default (`create-only`) to avoid duplicates
 - Collector strategy: full scan on first run, boundary-stop on subsequent runs
 - Multi-environment config fallback (CLI args / env vars / user config / OpenClaw config)
-- `Summary` is generated in Chinese by LLM by default (with cache + fallback)
+- `Summary` is generated in Chinese by OpenClaw native reading/summarization by default (with cache + fallback)
 - Requires a real Feishu user editor permission by default (owner_email/share_members)
 
 Default first-run shape:

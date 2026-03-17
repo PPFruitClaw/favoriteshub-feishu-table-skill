@@ -55,6 +55,7 @@ metadata:
    - 自动把主字段重命名为 `标题`，`所属平台/状态` 设为单选。
    - 自动清理默认空白子表（如 `数据表/表格1`）。
    - 默认要求配置真实用户可编辑权限（`--owner-email` / `feishu.owner_email` / `--share-member`）。
+   - 分享授权失败默认不中断初始化（可用 `--share-strict` 改为严格失败）。
 2. 初始化结果会写入 `output/feishu-target.json`（后续同步复用）。
 
 ### 2) 同步（常规执行）
@@ -76,7 +77,7 @@ metadata:
    - 可切换 `create-or-update`：已存在则更新
    - 不存在：创建新记录
    - 新记录默认 `状态=未学习`（更新记录不覆盖既有状态）
-   - `内容梗概` 默认走 LLM 中文概括（不照抄原文，且避免“该仓库/该收藏”开头）
+   - `内容梗概` 由 OpenClaw 自主读取链接语义并中文概括（不照抄原文，且避免“该仓库/该收藏”开头）
    - 摘要结果自动缓存到 `output/summary-cache.json`，减少重复调用
    - `收藏或星标数量` 按整数写入，GitHub/X/小红书/抖音若采集到均会写入
 
@@ -119,8 +120,8 @@ python3 ./scripts/sync_payload_to_feishu.py
 # 同步（显式指定配置文件）
 python3 ./scripts/sync_payload_to_feishu.py --config ./favoriteshub.config.json
 
-# 同步（显式指定摘要模型配置）
-python3 ./scripts/sync_payload_to_feishu.py --summary-model "gpt-4o-mini"
+# 同步（可选显式指定摘要模式，默认即 openclaw-native）
+python3 ./scripts/sync_payload_to_feishu.py --summary-mode openclaw-native
 
 # 一键全流程（无 target 时会自动初始化）
 ./scripts/sync_all_to_feishu.sh
@@ -146,8 +147,9 @@ COLLECT_LIMIT=100 ./scripts/run_phase2_probes.sh
 - `x` 未登录：`collect_x_bookmarks.sh` 会输出 `requires_login=true`，跳过写入该平台。
 - `xiaohongshu` 未登录：`collect_xhs_favorites.sh` 输出 `status=needs_login`，在当前 `openclaw browser` 窗口登录后重试。
 - `douyin` 未登录：输出 `status=needs_login`，等待用户登录后重试。
-- 未配置摘要 API key：自动切换规则摘要兜底，不阻塞写入。
+- 无需外部 API key：默认使用 OpenClaw 内置摘要流程，不阻塞写入。
 - 未配置真实用户权限：`init_feishu_bitable.py` 默认会报错并提示补齐 `owner_email/share_members`（可用 `--allow-bot-only` 强制跳过）。
+- 分享授权失败：默认记录到 `failed_members` 但不中断；可用 `--share-strict` 强制报错退出。
 - 飞书写入失败：保留 payload 与 target 配置，不丢弃采集结果，允许重放写入。
 
 ## 约束
