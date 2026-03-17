@@ -518,12 +518,6 @@ def main() -> None:
     for name, info in tables.items():
         info["fields"] = ensure_fields(client, app_token, info["table_id"])
     share_members = resolve_share_members(args, feishu_cfg)
-    if not share_members and not args.allow_bot_only:
-        raise RuntimeError(
-            "缺少真实用户编辑权限配置。请至少提供一种："
-            "--owner-email / --share-member / feishu.owner_email / FAVORITESHUB_OWNER_EMAIL；"
-            "如确需仅机器人可编辑，请显式添加 --allow-bot-only。"
-        )
     granted_members: list[dict[str, str]] = []
     failed_members: list[dict[str, str]] = []
     if share_members:
@@ -579,6 +573,14 @@ def main() -> None:
             owner_member_id = resolved_id
             owner_member_type = _normalize_member_type(args.transfer_owner_id_type)
             owner_identity_source = "email_resolved"
+
+    if not share_members and not args.allow_bot_only and not (transfer_owner and owner_member_id):
+        raise RuntimeError(
+            "缺少真实用户编辑权限配置。请至少提供一种："
+            "--owner-email / --share-member / feishu.owner_email / FAVORITESHUB_OWNER_EMAIL；"
+            "或提供可用于所有权转移的 member_id / 可解析邮箱。"
+            "如确需仅机器人可编辑，请显式添加 --allow-bot-only。"
+        )
 
     owner_transfer = {"attempted": False, "ok": False, "member_id": "", "member_type": "", "error": ""}
     if transfer_owner and owner_member_id:
