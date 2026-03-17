@@ -77,8 +77,10 @@ metadata:
    - 可切换 `create-or-update`：已存在则更新
    - 不存在：创建新记录
    - 新记录默认 `状态=未学习`（更新记录不覆盖既有状态）
+   - `标题` 优先从链接页元数据解析（`og:title` / `twitter:title` / `<title>`），失败自动回退并缓存
    - `内容梗概` 由 OpenClaw 自主读取链接语义并中文概括（不照抄原文，且避免“该仓库/该收藏”开头）
    - 摘要结果自动缓存到 `output/summary-cache.json`，减少重复调用
+   - 标题结果自动缓存到 `output/title-cache.json`，减少重复解析
    - `收藏或星标数量` 按整数写入，GitHub/X/小红书/抖音若采集到均会写入
 
 ### 3) 临时链接入库（other）

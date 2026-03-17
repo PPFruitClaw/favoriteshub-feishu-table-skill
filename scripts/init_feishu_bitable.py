@@ -33,7 +33,7 @@ TABLE_NAME_ALIASES = {
     "other": ["other", "其他"],
 }
 PLATFORM_OPTIONS = [{"name": TABLE_DISPLAY_NAMES[k]} for k in TABLES]
-STATUS_OPTIONS = [{"name": x} for x in ["已学习", "已过期", "未学习"]]
+STATUS_OPTIONS = [{"name": x} for x in ["已学习", "已过期", "未学习", "重点收藏"]]
 DEFAULT_GARBAGE_TABLE_NAMES = {"数据表", "表格", "表格1", "table1", "Table1"}
 
 # 1=Text, 2=Number, 3=SingleSelect, 5=DateTime, 15=URL

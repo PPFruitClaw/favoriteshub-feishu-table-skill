@@ -28,7 +28,7 @@
 统一字段：
 - 标题（主字段，多行文本）
 - 所属平台
-- 状态（单选：已学习/已过期/未学习，默认未学习）
+- 状态（单选：已学习/已过期/未学习/重点收藏，默认未学习）
 - 链接
 - 内容梗概
 - 收藏或星标数量
@@ -37,6 +37,7 @@
 数量字段说明：
 - `收藏或星标数量` 使用整数写入
 - GitHub / X / 小红书 / 抖音若采集到数量均会写入，不再仅限 GitHub
+- 标题优先从链接页面解析（`og:title` / `twitter:title` / `title`），失败时自动回退
 
 快速开始：
 ```bash
@@ -88,7 +89,7 @@ Default first-run shape:
 Unified fields:
 - Title (primary)
 - Platform
-- Status (single select: 未学习/已学习/已过期; default 未学习)
+- Status (single select: 未学习/已学习/已过期/重点收藏; default 未学习)
 - Link
 - Summary
 - Favorite/Star Count
@@ -97,6 +98,7 @@ Unified fields:
 Count behavior:
 - `Favorite/Star Count` is stored as integer
 - If available, GitHub/X/Xiaohongshu/Douyin counts are all written (not GitHub-only)
+- Title prefers link-page metadata (`og:title` / `twitter:title` / `title`) with automatic fallback
 
 Quick start:
 ```bash

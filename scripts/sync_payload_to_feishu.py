@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
+import ipaddress
 import json
 import re
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -31,6 +34,15 @@ PLATFORM_VALUE_MAP = {
 SUMMARY_BANNED_PREFIX = re.compile(
     r"^(该仓库|该收藏(?:内容)?|这个收藏(?:内容)?|此收藏(?:内容)?|本收藏(?:内容)?|本仓库)\s*[：:，, ]*"
 )
+TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+OG_TITLE_RE = re.compile(
+    r"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"'](.*?)[\"'][^>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
+TW_TITLE_RE = re.compile(
+    r"<meta[^>]+name=[\"']twitter:title[\"'][^>]+content=[\"'](.*?)[\"'][^>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         "--summary-cache",
         default=str(skill_root / "output" / "summary-cache.json"),
         help="内容梗概缓存（减少重复概括）",
+    )
+    p.add_argument(
+        "--title-cache",
+        default=str(skill_root / "output" / "title-cache.json"),
+        help="标题缓存（减少重复链接解析）",
     )
     p.add_argument(
         "--summary-mode",
@@ -134,7 +151,7 @@ def _parse_int_count(value: Any) -> int | None:
         val = int(base * factor)
         return val if val >= 0 else None
     try:
-        num = int(float(text))
+        num = int(round(float(text)))
         return num if num >= 0 else None
     except ValueError:
         return None
@@ -151,7 +168,7 @@ def _extract_repo_name_from_link(link: str) -> str:
     return ""
 
 
-def _extract_title(record: dict[str, Any]) -> str:
+def _extract_title_fallback(record: dict[str, Any]) -> str:
     title = _clean_text(record.get("标题") or "")
     if title:
         return title[:120]
@@ -169,6 +186,109 @@ def _extract_title(record: dict[str, Any]) -> str:
         host = urlparse(link).netloc or link
         return f"{platform_select_value(platform)} 收藏 - {host}"[:120]
     return f"{platform_select_value(platform)} 收藏内容"
+
+
+def _looks_generic_title(title: str) -> bool:
+    t = _clean_text(title).strip().lower()
+    if not t or len(t) <= 2:
+        return True
+    generic_exact = {
+        "x",
+        "github",
+        "douyin",
+        "xiaohongshu",
+        "登录",
+        "log in",
+        "just a moment...",
+    }
+    if t in generic_exact:
+        return True
+    generic_contains = ["登录", "sign in", "log in", "安全验证", "just a moment", "访问受限"]
+    return any(x in t for x in generic_contains)
+
+
+def _normalize_page_title(raw: str) -> str:
+    text = html.unescape(re.sub(r"<[^>]+>", " ", raw))
+    text = _clean_text(text).strip("-_|· ")
+    for sep in [" - ", " | ", " · ", " — ", "_"]:
+        if sep in text:
+            left, right = text.rsplit(sep, 1)
+            right_l = right.strip().lower()
+            if right_l in {"github", "x", "twitter", "小红书", "抖音", "douyin"}:
+                text = left.strip()
+                break
+    if len(text) > 120:
+        text = text[:120].rstrip()
+    return text
+
+
+def _fetch_title_from_link(link: str, *, timeout: int = 10) -> str:
+    if not link or not re.match(r"^https?://", link, flags=re.IGNORECASE):
+        return ""
+    parsed = urlparse(link)
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return ""
+    if host == "localhost":
+        return ""
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return ""
+    except ValueError:
+        pass
+    req = urllib.request.Request(
+        link,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(220_000).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+    for pattern in (OG_TITLE_RE, TW_TITLE_RE, TITLE_TAG_RE):
+        m = pattern.search(raw)
+        if not m:
+            continue
+        candidate = _normalize_page_title(m.group(1))
+        if candidate and not _looks_generic_title(candidate):
+            return candidate
+    return ""
+
+
+class LinkTitleResolver:
+    def __init__(self, *, cache: dict[str, str]):
+        self.cache = cache
+        self.cache_hits = 0
+        self.fetch_attempts = 0
+        self.fetch_success = 0
+        self.fetch_failures = 0
+
+    def resolve(self, record: dict[str, Any]) -> str:
+        link = _clean_text(record.get("链接"))
+        if link:
+            cached = self.cache.get(link)
+            if isinstance(cached, str) and cached.strip():
+                self.cache_hits += 1
+                return cached[:120]
+
+            self.fetch_attempts += 1
+            fetched = _fetch_title_from_link(link)
+            if fetched:
+                self.fetch_success += 1
+                self.cache[link] = fetched
+                return fetched[:120]
+            self.fetch_failures += 1
+
+        fallback = _extract_title_fallback(record)
+        if link and fallback:
+            self.cache[link] = fallback
+        return fallback
 
 
 def _fallback_summary(platform: str, title: str, raw_summary: str, link: str) -> str:
@@ -296,11 +416,12 @@ def to_fields(
     link_field_type: int,
     *,
     summarizer: ChineseSummarizer,
+    title_resolver: LinkTitleResolver,
     default_status: bool,
 ) -> dict[str, Any]:
     link = str(record.get("链接", "")).strip()
     platform_key = normalize_platform(str(record.get("所属平台", "")))
-    title = _extract_title(record)
+    title = title_resolver.resolve(record)
     summary_zh = summarizer.summarize(
         platform=platform_key,
         title=title,
@@ -319,7 +440,7 @@ def to_fields(
         fields["链接"] = link
     if default_status:
         status = _clean_text(record.get("状态") or "未学习")
-        if status not in {"已学习", "已过期", "未学习"}:
+        if status not in {"已学习", "已过期", "未学习", "重点收藏"}:
             status = "未学习"
         fields["状态"] = status
 
@@ -386,10 +507,12 @@ def main() -> None:
     client = FeishuBitableClient(app_id, app_secret, base_url)
 
     summary_cache = load_summary_cache(args.summary_cache)
+    title_cache = load_summary_cache(args.title_cache)
     summarizer = ChineseSummarizer(
         mode=args.summary_mode,
         cache=summary_cache,
     )
+    title_resolver = LinkTitleResolver(cache=title_cache)
 
     state = load_state(args.state)
     state_tables = state.setdefault("tables", {})
@@ -410,6 +533,12 @@ def main() -> None:
             "fallback_used": 0,
             "last_error": "",
             "disabled_reason": "",
+        },
+        "title_engine": {
+            "cache_hits": 0,
+            "fetch_attempts": 0,
+            "fetch_success": 0,
+            "fetch_failures": 0,
         },
         "by_platform": {},
     }
@@ -460,11 +589,23 @@ def main() -> None:
 
             try:
                 if link in existing and args.write_mode == "create-or-update":
-                    fields = to_fields(row, link_field_type, summarizer=summarizer, default_status=False)
+                    fields = to_fields(
+                        row,
+                        link_field_type,
+                        summarizer=summarizer,
+                        title_resolver=title_resolver,
+                        default_status=False,
+                    )
                     client.update_record(app_token, table_id, existing[link], fields)
                     p_updated += 1
                 elif link not in existing:
-                    fields = to_fields(row, link_field_type, summarizer=summarizer, default_status=True)
+                    fields = to_fields(
+                        row,
+                        link_field_type,
+                        summarizer=summarizer,
+                        title_resolver=title_resolver,
+                        default_status=True,
+                    )
                     created = client.create_record(app_token, table_id, fields)
                     created_id = created.get("record_id")
                     if created_id:
@@ -497,10 +638,15 @@ def main() -> None:
     summary["summary_engine"]["fallback_used"] = summarizer.fallback_used
     summary["summary_engine"]["last_error"] = summarizer.last_error
     summary["summary_engine"]["disabled_reason"] = summarizer.disabled_reason
+    summary["title_engine"]["cache_hits"] = title_resolver.cache_hits
+    summary["title_engine"]["fetch_attempts"] = title_resolver.fetch_attempts
+    summary["title_engine"]["fetch_success"] = title_resolver.fetch_success
+    summary["title_engine"]["fetch_failures"] = title_resolver.fetch_failures
 
     if not args.dry_run:
         save_state(args.state, state)
         save_summary_cache(args.summary_cache, summary_cache)
+        save_summary_cache(args.title_cache, title_cache)
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
