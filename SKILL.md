@@ -56,6 +56,7 @@ metadata:
    - 自动清理默认空白子表（如 `数据表/表格1`）。
    - 默认要求配置真实用户可编辑权限（`--owner-email` / `feishu.owner_email` / `--share-member`）。
    - 分享授权失败默认不中断初始化（可用 `--share-strict` 改为严格失败）。
+   - 默认会把文档所有权转移到真实用户（可用 `--skip-owner-transfer` 关闭）。
 2. 初始化结果会写入 `output/feishu-target.json`（后续同步复用）。
 
 ### 2) 同步（常规执行）
@@ -116,6 +117,9 @@ python3 ./scripts/init_feishu_bitable.py --share-member "email:you@example.com:f
 # 初始化并绑定真实用户编辑权限（推荐）
 python3 ./scripts/init_feishu_bitable.py --owner-email "you@example.com"
 
+# 初始化并在所有权转移失败时立即退出（可选）
+python3 ./scripts/init_feishu_bitable.py --owner-email "you@example.com" --transfer-owner-strict
+
 # 同步 payload 到飞书
 python3 ./scripts/sync_payload_to_feishu.py
 
@@ -152,6 +156,7 @@ COLLECT_LIMIT=100 ./scripts/run_phase2_probes.sh
 - 无需外部 API key：默认使用 OpenClaw 内置摘要流程，不阻塞写入。
 - 未配置真实用户权限：`init_feishu_bitable.py` 默认会报错并提示补齐 `owner_email/share_members`（可用 `--allow-bot-only` 强制跳过）。
 - 分享授权失败：默认记录到 `failed_members` 但不中断；可用 `--share-strict` 强制报错退出。
+- 所有权转移失败：默认记录到 `owner_transfer` 但不中断；可用 `--transfer-owner-strict` 强制报错退出。
 - 飞书写入失败：保留 payload 与 target 配置，不丢弃采集结果，允许重放写入。
 
 ## 约束

@@ -482,3 +482,42 @@ class FeishuBitableClient:
         if last_err:
             raise last_err
         raise FeishuApiError("add_permission_member failed")
+
+    def transfer_permission_owner(
+        self,
+        token: str,
+        *,
+        member_id: str,
+        member_type: str = "email",
+        file_type: str = "bitable",
+    ) -> dict[str, Any]:
+        """Transfer file ownership to target member.
+
+        Feishu/Lark API variants differ across versions, so this method tries
+        multiple compatible endpoints/methods and returns first success.
+        """
+        params = {"type": file_type}
+        body = {
+            "member_id": member_id,
+            "member_type": member_type,
+        }
+        last_err: Exception | None = None
+        for method in ("POST", "PUT"):
+            for path, api_name in [
+                (f"/open-apis/drive/v1/permissions/{token}/members/transfer_owner", "drive.permission.member.transfer.v1"),
+                (f"/open-apis/drive/v2/permissions/{token}/members/transfer_owner", "drive.permission.member.transfer.v2"),
+                (f"/open-apis/drive/v1/permissions/{token}/members/transfer", "drive.permission.member.transfer_alt.v1"),
+                (f"/open-apis/drive/v2/permissions/{token}/members/transfer", "drive.permission.member.transfer_alt.v2"),
+            ]:
+                try:
+                    url = self._url(path, params)
+                    payload = self._ensure_ok(
+                        _http_json(method, url, headers=self._auth_headers(), data=body),
+                        api_name,
+                    )
+                    return (payload.get("data") or {}).get("member") or {}
+                except Exception as e:  # pragma: no cover
+                    last_err = e
+        if last_err:
+            raise last_err
+        raise FeishuApiError("transfer_permission_owner failed")

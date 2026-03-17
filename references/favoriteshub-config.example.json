@@ -6,6 +6,8 @@
     "app_token": "",
     "folder_token": "",
     "owner_email": "",
+    "transfer_owner": true,
+    "transfer_owner_email": "",
     "share_members": []
   }
 }

@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--folder-token", default="", help="创建新多维表格时放置目录 token（可选）")
     p.add_argument("--owner-email", default="", help="真实飞书用户邮箱（默认授予 full_access）")
     p.add_argument(
+        "--transfer-owner-email",
+        default="",
+        help="转移所有权目标邮箱（默认复用 owner_email）",
+    )
+    p.add_argument(
         "--share-member",
         action="append",
         default=[],
@@ -77,6 +82,16 @@ def parse_args() -> argparse.Namespace:
         "--share-strict",
         action="store_true",
         help="分享成员授权失败时立即报错退出（默认失败不阻塞初始化）",
+    )
+    p.add_argument(
+        "--skip-owner-transfer",
+        action="store_true",
+        help="跳过所有权转移（默认有真实用户邮箱时会自动尝试转移）",
+    )
+    p.add_argument(
+        "--transfer-owner-strict",
+        action="store_true",
+        help="所有权转移失败时立即报错退出（默认失败不中断初始化）",
     )
     p.add_argument(
         "--out",
@@ -231,6 +246,48 @@ def _is_valid_email(email: str) -> bool:
     return re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e) is not None
 
 
+def _resolve_owner_email(args: argparse.Namespace, feishu_cfg: dict[str, Any]) -> str:
+    owner_email = str(
+        args.owner_email
+        or feishu_cfg.get("owner_email")
+        or feishu_cfg.get("user_email")
+        or feishu_cfg.get("editor_email")
+        or ""
+    ).strip()
+    if not owner_email:
+        owner_email = str(os.getenv("FAVORITESHUB_OWNER_EMAIL", "")).strip()
+    if not owner_email:
+        owner_email = str(os.getenv("FEISHU_USER_EMAIL", "")).strip()
+    return owner_email
+
+
+def _resolve_transfer_owner_email(args: argparse.Namespace, feishu_cfg: dict[str, Any]) -> str:
+    transfer_email = str(
+        args.transfer_owner_email
+        or feishu_cfg.get("transfer_owner_email")
+        or feishu_cfg.get("transferOwnerEmail")
+        or ""
+    ).strip()
+    if transfer_email:
+        return transfer_email
+    return _resolve_owner_email(args, feishu_cfg)
+
+
+def _truthy(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def resolve_share_members(args: argparse.Namespace, feishu_cfg: dict[str, Any]) -> list[dict[str, str]]:
     members: list[dict[str, str]] = []
 
@@ -253,17 +310,7 @@ def resolve_share_members(args: argparse.Namespace, feishu_cfg: dict[str, Any]) 
                 if member_type and member_id:
                     members.append({"member_type": member_type, "member_id": member_id, "perm": perm})
 
-    owner_email = str(
-        args.owner_email
-        or feishu_cfg.get("owner_email")
-        or feishu_cfg.get("user_email")
-        or feishu_cfg.get("editor_email")
-        or ""
-    ).strip()
-    if not owner_email:
-        owner_email = str(os.getenv("FAVORITESHUB_OWNER_EMAIL", "")).strip()
-    if not owner_email:
-        owner_email = str(os.getenv("FEISHU_USER_EMAIL", "")).strip()
+    owner_email = _resolve_owner_email(args, feishu_cfg)
     if owner_email and not _is_placeholder_email(owner_email):
         members.append({"member_type": "email", "member_id": owner_email, "perm": "full_access"})
 
@@ -323,6 +370,40 @@ def ensure_share_members(
     return granted, failed
 
 
+def try_transfer_owner(
+    client: FeishuBitableClient,
+    app_token: str,
+    *,
+    email: str,
+    strict: bool = False,
+) -> dict[str, Any]:
+    member_id = str(email or "").strip()
+    if not member_id or _is_placeholder_email(member_id) or not _is_valid_email(member_id):
+        return {"attempted": False, "ok": False, "member_id": member_id, "error": "invalid_or_placeholder_email"}
+    try:
+        result = client.transfer_permission_owner(
+            app_token,
+            member_id=member_id,
+            member_type="email",
+            file_type="bitable",
+        )
+        return {
+            "attempted": True,
+            "ok": True,
+            "member_id": member_id,
+            "result": result,
+        }
+    except Exception as e:
+        if strict:
+            raise
+        return {
+            "attempted": True,
+            "ok": False,
+            "member_id": member_id,
+            "error": str(e),
+        }
+
+
 def main() -> None:
     args = parse_args()
     user_cfg = load_user_config(args.config or None)
@@ -379,6 +460,24 @@ def main() -> None:
             share_members,
             strict=args.share_strict,
         )
+    cfg_transfer_owner = feishu_cfg.get("transfer_owner")
+    transfer_owner = (not args.skip_owner_transfer) and _truthy(cfg_transfer_owner, default=True)
+    transfer_owner_email = _resolve_transfer_owner_email(args, feishu_cfg)
+    owner_transfer = {"attempted": False, "ok": False, "member_id": "", "error": ""}
+    if transfer_owner and transfer_owner_email:
+        owner_transfer = try_transfer_owner(
+            client,
+            app_token,
+            email=transfer_owner_email,
+            strict=args.transfer_owner_strict,
+        )
+    elif transfer_owner and not transfer_owner_email:
+        owner_transfer = {
+            "attempted": False,
+            "ok": False,
+            "member_id": "",
+            "error": "missing_transfer_owner_email",
+        }
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,6 +490,7 @@ def main() -> None:
         "removed_tables": removed_tables,
         "granted_members": granted_members,
         "failed_members": failed_members,
+        "owner_transfer": owner_transfer,
     }
     out_path.write_text(json.dumps(out_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -404,6 +504,7 @@ def main() -> None:
                 "removed_tables": removed_tables,
                 "granted_members": granted_members,
                 "failed_members": failed_members,
+                "owner_transfer": owner_transfer,
             },
             ensure_ascii=False,
         )

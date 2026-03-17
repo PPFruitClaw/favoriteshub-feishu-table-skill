@@ -11,6 +11,7 @@
   "removed_tables": ["数据表"],
   "granted_members": [{"member_type": "email", "member_id": "you@example.com", "perm": "full_access"}],
   "failed_members": [],
+  "owner_transfer": {"attempted": true, "ok": true, "member_id": "you@example.com"},
   "tables": {
     "github": {
       "table_id": "tblxxxx",
@@ -37,4 +38,5 @@
 补充：
 - 凭据建议放在用户配置文件中，通过 `--config` 或 `FAVORITESHUB_CONFIG` 指定。
 - 可用 `--share-member email:you@example.com:full_access` 自动授权协作者。
+- 默认会尝试把所有权转移给真实用户（可用 `--skip-owner-transfer` 关闭）。
 - 示例见 `references/favoriteshub-config.example.json`。
