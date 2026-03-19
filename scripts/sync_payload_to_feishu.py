@@ -9,6 +9,7 @@ import html
 import ipaddress
 import json
 import re
+import subprocess
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
@@ -83,6 +84,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dry-run", action="store_true", help="仅输出将要写入的统计，不实际写入")
     p.add_argument("--strict", action="store_true", help="遇到单条记录失败即退出（默认跳过并继续）")
+    p.add_argument("--platforms", default="", help="仅处理指定平台，逗号分隔，如 github,x")
     return p.parse_args()
 
 
@@ -168,24 +170,88 @@ def _extract_repo_name_from_link(link: str) -> str:
     return ""
 
 
-def _extract_title_fallback(record: dict[str, Any]) -> str:
-    title = _clean_text(record.get("标题") or "")
-    if title:
-        return title[:120]
-    platform = normalize_platform(str(record.get("所属平台", "")))
-    link = _clean_text(record.get("链接"))
-    summary = _clean_text(record.get("内容梗概"))
+def _extract_repo_slug_parts(link: str) -> tuple[str, str]:
+    repo = _extract_repo_name_from_link(link)
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        return owner.strip(), name.strip()
+    return "", repo.strip()
 
+
+def _strip_noise(text: str) -> str:
+    out = _clean_text(text)
+    out = re.sub(r"^GitHub\s*[-:|]\s*", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^X\s*[:：-]\s*", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^Twitter\s*[:：-]\s*", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"^[#【\[]?\s*(仓库|项目|帖子|推文|笔记|视频|链接)\s*[】\]]?\s*[:：-]\s*", "", out)
+    out = re.sub(r"@[A-Za-z0-9_]+", "", out)
+    out = re.sub(r"\b[A-Z][a-z]{2}\s+\d{1,2}\b", "", out)
+    out = re.sub(r"\bArticle\b", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"https?://\S+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\b[\w.-]+/[\w.-]+\b", "", out)
+    out = re.sub(r"\s+", " ", out).strip(" -_|·:：，,。")
+    return out
+
+
+def _trim_sentence(text: str, limit: int) -> str:
+    out = _strip_noise(text)
+    if len(out) <= limit:
+        return out
+    shortened = out[:limit]
+    for sep in ["。", "！", "？", ";", "；", ",", "，", " "]:
+        idx = shortened.rfind(sep)
+        if idx >= max(12, limit // 2):
+            shortened = shortened[:idx]
+            break
+    return shortened.strip(" -_|·:：，,。")
+
+
+def _make_chinese_title(platform: str, raw_title: str, raw_summary: str, link: str) -> str:
+    title = _trim_sentence(raw_title, 34)
+    summary = _trim_sentence(raw_summary, 50)
     if platform == "github":
+        owner, name = _extract_repo_slug_parts(link)
+        if title and len(title) >= 6 and title.lower() not in {name.lower(), f"{owner}/{name}".lower()}:
+            return title[:40]
+        if summary and len(summary) >= 6:
+            return summary[:40]
+        if name:
+            return f"{name} 项目"[:40]
         repo = _extract_repo_name_from_link(link)
         if repo:
-            return repo[:120]
+            return repo[:40]
+    if platform == "x":
+        if title and len(title) >= 10:
+            return title[:40]
+        if summary and len(summary) >= 10:
+            return summary[:40]
+        return "X 内容摘录"
+    if platform == "xiaohongshu":
+        if title and len(title) >= 6:
+            return title[:40]
+        if summary and len(summary) >= 6:
+            return summary[:40]
+        return "小红书笔记"
+    if platform == "douyin":
+        if title and len(title) >= 6:
+            return title[:40]
+        if summary and len(summary) >= 6:
+            return summary[:40]
+        return "抖音视频"
+    if title:
+        return title[:40]
     if summary:
-        return summary[:50]
-    if link:
-        host = urlparse(link).netloc or link
-        return f"{platform_select_value(platform)} 收藏 - {host}"[:120]
-    return f"{platform_select_value(platform)} 收藏内容"
+        return summary[:40]
+    host = urlparse(link).netloc or "链接"
+    return f"{host} 内容"
+
+
+def _extract_title_fallback(record: dict[str, Any]) -> str:
+    platform = normalize_platform(str(record.get("所属平台", "")))
+    link = _clean_text(record.get("链接"))
+    title = _clean_text(record.get("标题") or "")
+    summary = _clean_text(record.get("内容梗概") or "")
+    return _make_chinese_title(platform, title, summary, link)[:120]
 
 
 def _looks_generic_title(title: str) -> bool:
@@ -261,6 +327,10 @@ def _fetch_title_from_link(link: str, *, timeout: int = 10) -> str:
     return ""
 
 
+# 标题/梗概生成已改为由主代理直接负责，不再由此脚本自动读页面并产出最终文案。
+# 本脚本保留为结构化同步器：负责把 payload 里的结果可靠写入飞书表。
+
+
 class LinkTitleResolver:
     def __init__(self, *, cache: dict[str, str]):
         self.cache = cache
@@ -271,20 +341,11 @@ class LinkTitleResolver:
 
     def resolve(self, record: dict[str, Any]) -> str:
         link = _clean_text(record.get("链接"))
-        if link:
-            cached = self.cache.get(link)
-            if isinstance(cached, str) and cached.strip():
-                self.cache_hits += 1
-                return cached[:120]
-
-            self.fetch_attempts += 1
-            fetched = _fetch_title_from_link(link)
-            if fetched:
-                self.fetch_success += 1
-                self.cache[link] = fetched
-                return fetched[:120]
-            self.fetch_failures += 1
-
+        raw_title = _clean_text(record.get("标题") or "")
+        if raw_title:
+            if link:
+                self.cache[link] = raw_title
+            return raw_title[:120]
         fallback = _extract_title_fallback(record)
         if link and fallback:
             self.cache[link] = fallback
@@ -292,54 +353,40 @@ class LinkTitleResolver:
 
 
 def _fallback_summary(platform: str, title: str, raw_summary: str, link: str) -> str:
-    text = _clean_text(raw_summary)
-    if platform == "github":
-        repo = _extract_repo_name_from_link(link) or title or "这个项目"
-        if text:
-            return f"{repo}围绕{text[:72]}展开，包含可直接复用的实现思路与技术要点。"
-        return f"{repo}聚焦具体开发问题，建议结合 README 和目录结构快速判断可复用价值。"
+    text = _trim_sentence(raw_summary, 110)
     if text:
-        return f"内容围绕{text[:78]}展开，适合按主题回看并提炼可执行的方法或观点。"
-    if platform == "douyin":
-        return "视频主题与观点已入库，可回看原视频和评论区补全上下文信息。"
+        return text
+    if platform == "github":
+        owner, name = _extract_repo_slug_parts(link)
+        repo_name = name or _extract_repo_name_from_link(link) or _strip_noise(title) or "这个项目"
+        return f"{repo_name} 的项目说明、能力边界和使用场景。"
     if platform == "x":
-        return "帖子讨论已入库，可回看线程上下文和引用关系提炼关键结论。"
+        return "帖子里的核心观点、方法或结论。"
     if platform == "xiaohongshu":
-        return "图文笔记已入库，可回看图片细节和评论反馈提炼实践要点。"
-    return "链接内容已入库，建议后续补充核心观点、适用场景和可执行结论。"
+        return "笔记里的经验、做法和适用场景。"
+    if platform == "douyin":
+        return "视频里的主要观点、步骤或经验。"
+    return "链接里的主要内容和关键信息。"
 
 
 def _normalize_summary_output(text: str, *, platform: str, title: str, raw_summary: str, link: str) -> str:
     out = _clean_text(text).strip("“”\"' ")
     out = SUMMARY_BANNED_PREFIX.sub("", out).strip()
+    out = _strip_noise(out)
     if not out:
         out = _fallback_summary(platform, title, raw_summary, link)
-    raw_clean = _clean_text(raw_summary).rstrip("。")
-    if raw_clean and out.rstrip("。") == raw_clean:
-        out = _fallback_summary(platform, title, raw_summary, link)
     if len(out) > 140:
-        out = out[:140].rstrip()
+        out = _trim_sentence(out, 140)
     if out and out[-1] not in "。！？":
         out += "。"
     return out
 
 
 def _native_summary(platform: str, title: str, raw_summary: str, link: str) -> tuple[str, bool]:
-    text = _clean_text(raw_summary)
-    if not text:
-        return _fallback_summary(platform, title, raw_summary, link), True
-
-    core = text[:90]
-    if platform == "github":
-        repo = _extract_repo_name_from_link(link) or title or "这个项目"
-        return f"{repo}主要覆盖{core[:60]}，适合快速评估技术路线并提炼可复用实现。", False
-    if platform == "x":
-        return f"这条内容重点讨论{core[:72]}，建议结合上下文线程整理关键观点与结论。", False
-    if platform == "douyin":
-        return f"这条视频围绕{core[:72]}展开，回看时可重点关注可执行步骤与经验要点。", False
-    if platform == "xiaohongshu":
-        return f"这篇笔记聚焦{core[:72]}，可结合图文细节提炼适用场景和实践方法。", False
-    return f"这条收藏内容围绕{core[:72]}展开，建议按主题沉淀可执行的关键结论。", False
+    text = _trim_sentence(raw_summary, 110)
+    if text:
+        return text, False
+    return _fallback_summary(platform, title, raw_summary, link), True
 
 
 def load_summary_cache(path: str) -> dict[str, str]:
@@ -387,19 +434,12 @@ class ChineseSummarizer:
             self.cache_hits += 1
             return cached
 
-        output = ""
-        used_fallback = False
-        try:
-            output, used_fallback = _native_summary(platform, title, raw_summary, link)
-        except Exception as e:
-            self.last_error = str(e)
-            self.disabled_reason = "native_summary_failed"
+        output = _clean_text(raw_summary)
+        if not output:
             output = _fallback_summary(platform, title, raw_summary, link)
-            used_fallback = True
+            self.fallback_used += 1
 
         self.generated += 1
-        if used_fallback:
-            self.fallback_used += 1
         final_summary = _normalize_summary_output(
             output,
             platform=platform,
@@ -493,9 +533,15 @@ def main() -> None:
         raise RuntimeError("target 缺少 app_token，请先执行 init_feishu_bitable.py")
 
     records = payload.get("records") or []
+    platform_filter = {
+        normalize_platform(x)
+        for x in [s.strip() for s in str(args.platforms or '').split(',') if s.strip()]
+    }
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in records:
         platform = normalize_platform(str(row.get("所属平台", "")))
+        if platform_filter and platform not in platform_filter:
+            continue
         groups[platform].append(row)
 
     app_id, app_secret, base_url = load_feishu_credentials(

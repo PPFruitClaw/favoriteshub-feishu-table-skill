@@ -42,7 +42,7 @@ REQUIRED_FIELDS: list[tuple[str, int, dict[str, Any] | None]] = [
     ("状态", 3, {"options": STATUS_OPTIONS}),
     ("链接", 15, None),
     ("内容梗概", 1, None),
-    ("收藏或星标数量", 2, None),
+    ("收藏或星标数量", 2, {"formatter": "0"}),
     ("收录时间", 5, None),
 ]
 
@@ -412,6 +412,16 @@ def ensure_share_members(
                 raise RuntimeError(f"无效邮箱：{member_id}")
             continue
 
+        # 默认优先将邮箱解析为 open_id，减少因 email 类型不兼容导致的授权失败。
+        if member_type == "email":
+            try:
+                resolved_open_id = client.resolve_user_id_by_email(member_id, user_id_type="open_id")
+            except Exception:
+                resolved_open_id = ""
+            if resolved_open_id:
+                member_type = "openid"
+                member_id = resolved_open_id
+
         try:
             client.add_permission_member(
                 app_token,
@@ -562,17 +572,26 @@ def main() -> None:
         owner_identity_source = "cache_member_id"
 
     if not owner_member_id and transfer_owner_email and _is_valid_email(transfer_owner_email):
+        resolved_id = ""
+        resolved_type = "open_id"
         try:
-            resolved_id = client.resolve_user_id_by_email(
-                transfer_owner_email,
-                user_id_type=args.transfer_owner_id_type,
-            )
+            resolved_id = client.resolve_user_id_by_email(transfer_owner_email, user_id_type="open_id")
         except Exception:
             resolved_id = ""
+        # 兼容手工指定其它 id 类型，但默认仍优先 open_id。
+        if (not resolved_id) and str(args.transfer_owner_id_type).strip() not in {"", "open_id"}:
+            try:
+                resolved_id = client.resolve_user_id_by_email(
+                    transfer_owner_email,
+                    user_id_type=args.transfer_owner_id_type,
+                )
+                resolved_type = str(args.transfer_owner_id_type).strip()
+            except Exception:
+                resolved_id = ""
         if resolved_id:
             owner_member_id = resolved_id
-            owner_member_type = _normalize_member_type(args.transfer_owner_id_type)
-            owner_identity_source = "email_resolved"
+            owner_member_type = _normalize_member_type(resolved_type)
+            owner_identity_source = "email_resolved_open_id" if resolved_type == "open_id" else "email_resolved_fallback"
 
     if not share_members and not args.allow_bot_only and not (transfer_owner and owner_member_id):
         raise RuntimeError(

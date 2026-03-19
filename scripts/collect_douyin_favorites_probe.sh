@@ -7,8 +7,11 @@ SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LIMIT="${1:-0}"
 OUT_FILE="${2:-$SKILL_ROOT/output/douyin-favorites-probe.json}"
 STATE_FILE="${3:-$SKILL_ROOT/output/collector-state.json}"
+# 兼容旧脚本名，但当前业务方案已不是“列表页滚动抓全量”，而是：
+# 收藏 -> 视频 -> 点击首条进入详情流 -> ArrowDown 逐条切换。
+# 这里保留旧脚本仅用于过渡排障；后续正式实现应优先按详情流模型重构。
 MAX_SCROLL_ROUNDS="${MAX_SCROLL_ROUNDS:-120}"
-NO_GROWTH_THRESHOLD="${NO_GROWTH_THRESHOLD:-3}"
+NO_GROWTH_THRESHOLD="${NO_GROWTH_THRESHOLD:-6}"
 
 if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
   echo "invalid limit: $LIMIT" >&2
@@ -39,6 +42,10 @@ else
   FIRST_RUN=true
 fi
 
+# 再强调一次：这里的 full_scan / incremental 是“旧 probe 采集脚本自己的术语”，
+# 不是抖音当前正式业务方案的权威定义。当前正式方案的主语应当是“详情流中的继续/停止规则”，
+# 而不是“列表页是否全量扫描”。
+
 oc_eval() {
   local tid="$1"
   local fn="$2"
@@ -59,11 +66,49 @@ OPEN_JSON="$(openclaw browser open 'https://www.douyin.com/user/self?showTab=col
 TARGET_ID="$(echo "$OPEN_JSON" | jq -r '.targetId')"
 
 openclaw browser wait --target-id "$TARGET_ID" --load domcontentloaded --timeout-ms 45000 --json >/dev/null
+sleep 2
+
+# 关键修复：showTab=collection 并不稳定，必须显式点击“收藏”tab，随后再点击内层“视频”tab，确保进入“收藏 -> 视频”总表。
+# 但注意：进入这里之后，最新方案要求把“列表页”只当入口，不再把列表页当成主采集面；
+# 正式采集应点击第一条进入详情流，在详情流里用 ArrowDown 逐条切换，并以黄色收藏星标是否仍点亮作为越界停止核心信号。
+ACTIVATE_COLLECTION_JS="$(cat <<'EOF'
+() => {
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const tabs = [...document.querySelectorAll('[role="tab"], [aria-selected], div, span, button')];
+  const target = tabs.find(el => clean(el.innerText) === '收藏');
+  if (target) {
+    target.click();
+    return { clicked: true, text: clean(target.innerText) };
+  }
+  return { clicked: false };
+}
+EOF
+)"
+oc_eval "$TARGET_ID" "$ACTIVATE_COLLECTION_JS" >/dev/null || true
+sleep 2
+
+ACTIVATE_VIDEO_JS="$(cat <<'EOF'
+() => {
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const tabs = [...document.querySelectorAll('[role="tab"], [aria-selected], div, span, button')];
+  const target = tabs.find(el => clean(el.innerText) === '视频');
+  if (target) {
+    target.click();
+    return { clicked: true, text: clean(target.innerText) };
+  }
+  return { clicked: false };
+}
+EOF
+)"
+oc_eval "$TARGET_ID" "$ACTIVATE_VIDEO_JS" >/dev/null || true
+sleep 2
 
 EXTRACT_JS="$(cat <<'EOF'
 () => {
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
   const parseCompact = (raw) => {
-    const text = (raw || '').replace(/,/g, '').trim();
+    const text = clean(raw).replace(/,/g, '');
     if (!text) return null;
     const m = text.match(/^([0-9]+(?:\.[0-9]+)?)\s*([kKmMwW万亿wW]?)$/);
     if (!m) return null;
@@ -85,17 +130,14 @@ EXTRACT_JS="$(cat <<'EOF'
       ...card.querySelectorAll('[data-e2e*="like"], [data-e2e*="collect"], [class*="like"], [class*="digg"], [class*="collect"], [class*="count"], span')
     ].slice(0, 120);
     for (const node of candidateNodes) {
-      const t = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      const t = clean(node.textContent || '');
       if (!t || t.length > 24) continue;
       const m = t.match(/([0-9]+(?:\.[0-9]+)?\s*[kKmMwW万亿]?)/);
       if (!m) continue;
       const n = parseCompact(m[1]);
       if (n !== null) return n;
     }
-    const lines = (card.innerText || '')
-      .split('\n')
-      .map((x) => x.trim())
-      .filter((x) => x && x.length <= 24);
+    const lines = clean(card.innerText || '').split(' ').filter((x) => x && x.length <= 24);
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       const m = lines[i].match(/^([0-9]+(?:\.[0-9]+)?\s*[kKmMwW万亿]?)$/);
       if (!m) continue;
@@ -116,9 +158,24 @@ EXTRACT_JS="$(cat <<'EOF'
   ];
   const needsLogin = loginSignals.some((r) => r.test(text));
 
+  const tabs = [...document.querySelectorAll('[role="tab"], [aria-selected="true"], div, span, button')];
+  const collectionTab = tabs.find((el) => clean(el.innerText) === '收藏');
+  const videoTab = tabs.find((el) => clean(el.innerText) === '视频');
+  const activeCollection = !!collectionTab && (collectionTab.getAttribute('aria-selected') === 'true' || /active|selected/.test(collectionTab.outerHTML));
+  const activeVideo = !!videoTab && (videoTab.getAttribute('aria-selected') === 'true' || /active|selected/.test(videoTab.outerHTML));
+
+  // 过渡说明：这里只是“列表页容器内抓卡片”的旧 probe 思路残留。
+  // 它比“全页扫链接”更收敛，但仍不等于当前最新主方案。
+  // 最新主方案应在“收藏 -> 视频”里点击首条进入详情流，再用 ArrowDown 逐条切换，
+  // 并用“黄色收藏星标是否仍存在且点亮”来判断是否仍在收藏流中。
+  // 因此这里产出的 records 只可用于过渡排障，不应再被当作最终稳定采集逻辑。
+  const scope = document.querySelector('[data-e2e="user-favorite-list"] [data-e2e="scroll-list"]')
+    || document.querySelector('[data-e2e="user-post-list"] [data-e2e="scroll-list"]')
+    || document.querySelector('[data-e2e="scroll-list"]');
+
   const seen = new Set();
   const records = [];
-  const anchors = [...document.querySelectorAll('a[href*="/video/"]')];
+  const anchors = [...(scope ? scope.querySelectorAll('a[href*="/video/"], a[href*="/note/"]') : [])];
   for (const a of anchors) {
     let url = '';
     try {
@@ -129,13 +186,16 @@ EXTRACT_JS="$(cat <<'EOF'
       url = '';
     }
     if (!url || seen.has(url)) continue;
+    const card = a.closest('li, section, article, div') || a.parentElement || a;
+    const cardText = clean(card?.innerText || '');
+    const rect = card?.getBoundingClientRect ? card.getBoundingClientRect() : {top: 0, bottom: 0};
+    // 过滤底部推荐流/热门流：这类内容不是收藏，通常以“热门：抖音精选...”开头，且会在同一块区域挂出多条不同链接
+    if (!cardText || /热门：抖音精选/.test(cardText) || /热搜|推荐|抖音精选/.test(cardText.slice(0, 40))) continue;
     seen.add(url);
-    const card = a.closest('section,article,div') || a.parentElement || a;
-    const cardText = (card?.innerText || '').replace(/\s+/g, ' ').trim();
     const favCount = pickCountFromCard(card || a);
     records.push({
       link: url,
-      title: (`抖音视频 ${(url.split('/').pop() || '')}`).trim(),
+      title: (`抖音内容 ${(url.split('/').pop() || '')}`).trim(),
       summary: cardText.slice(0, 240),
       favorite_or_star_count: favCount,
     });
@@ -145,6 +205,8 @@ EXTRACT_JS="$(cat <<'EOF'
     page_url: location.href,
     title: document.title || '',
     needs_login: needsLogin,
+    active_collection: activeCollection,
+    active_video: activeVideo,
     records: (needsLogin ? [] : records)
   };
 }
@@ -152,8 +214,18 @@ EOF
 )"
 
 SCROLL_JS='() => {
-  window.scrollBy(0, Math.floor(window.innerHeight * 0.95));
-  return true;
+  const list = document.querySelector("[data-e2e=\"user-favorite-list\"] [data-e2e=\"scroll-list\"]")
+    || document.querySelector("[data-e2e=\"user-post-list\"] [data-e2e=\"scroll-list\"]")
+    || document.querySelector("[data-e2e=\"scroll-list\"]");
+  const delta = Math.max(260, Math.floor(window.innerHeight * 0.55));
+  if (list) {
+    const before = list.scrollTop;
+    list.scrollTop = list.scrollTop + delta;
+    return {ok: true, mode: 'list', before, top: list.scrollTop, delta};
+  }
+  const before = window.scrollY;
+  window.scrollBy(0, delta);
+  return {ok: true, mode: 'window', before, top: window.scrollY, delta};
 }'
 
 ACC_ITEMS='[]'
@@ -221,7 +293,7 @@ while [ "$ROUND" -le "$MAX_SCROLL_ROUNDS" ]; do
   fi
 
   oc_eval "$TARGET_ID" "$SCROLL_JS" >/dev/null
-  sleep 1
+  sleep 3
   ROUND=$((ROUND + 1))
 done
 
@@ -248,6 +320,7 @@ echo "$LAST_EVAL" | jq --arg now "$NOW_ISO" --arg mode "$MODE" --argjson items "
   source: "douyin",
   fetched_at: $now,
   mode: $mode,
+  note: "probe_only_not_official_flow",
   page: .result.page_url,
   status: (if .result.needs_login then "needs_login" elif (($items | length) > 0) then "ok" else "no_records" end),
   records: [

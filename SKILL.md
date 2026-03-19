@@ -62,25 +62,75 @@ metadata:
 
 ### 2) 同步（常规执行）
 
+#### 2.1 稳定脚本采集的平台
+
 1. 运行采集脚本：
   - `scripts/collect_github_stars.sh`
   - `scripts/collect_x_bookmarks.sh`
   - `scripts/collect_xhs_favorites.sh`
-  - `scripts/collect_douyin_favorites_probe.sh`
   - （可选）`scripts/add_other_link_record.sh <url> "<summary>"`
   - `scripts/merge_to_feishu_payload.sh`
   - 采集增量策略：
     - 首次（无 `output/collector-state.json`）：全量扫描当前可滚动收藏列表
     - 后续：命中“上次头部边界链接”即停止，减少重复遍历
     - 可用 `COLLECT_LIMIT` 限制单次最大采集条数（默认 `0` 表示不限制）
+
+#### 2.2 抖音（当前为流程主导，非脚本主导）
+
+> 当前抖音收藏采集的“正式方案”是**流程规则 + 人机协作**，而不是稳定脚本主导。
+> `scripts/collect_douyin_favorites_probe.sh`、`scripts/probe_douyin_detail_flow.js` 等仅可视为探针 / 过渡排障工具，
+> **不能**把它们当成已经定型的正式采集器。
+
+抖音当前正式主流程：
+- 进入 `收藏 -> 视频`
+- 点击第一条视频进入详情播放态
+- 在详情流中使用 `ArrowDown` 逐条切换
+- 每切到一条新内容后，优先读取当前详情右侧收藏按钮的 DOM 状态：`data-e2e="video-player-collect"` 与 `data-e2e-state`
+- 默认先按“视频型内容”处理
+- 遇到特殊结构时，再分流到“文章/跳转型”
+- 一旦收藏按钮不再满足 `data-e2e="video-player-collect"` + `data-e2e-state="video-player-is-collected"`，立即停止
+
+抖音当前强规则：
+- **抖音特别规则（强制）**：仅打开 `showTab=collection` 不可靠，必须显式切换到“收藏”tab，再确认内层“视频”tab 已选中；若页面仍停留在“作品”页，则本次采集视为未进入正确状态。
+- **抖音新版主流程（强制）**：进入 `收藏 -> 视频` 后，**必须点击第一条视频进入详情播放态**，随后在**视频详情流**里逐条向下切换；**不要再把“收藏列表页直接滚动抓全量”当成主方案**，列表页只负责提供入口首条。
+- **抖音详情态验收信号（强制校验）**：进入首条视频后，URL 通常表现为 `user/self?...modal_id=<视频ID>...`；后续是否成功切到下一条，优先看 `modal_id` 是否变化，而不是看 `/video/...` 路径。若没有进入 `modal_id` 详情态，就说明还没进入正确采集链路。
+- **抖音收藏态主判据（当前最高优先级）**：详情页右侧收藏按钮应优先通过 DOM 语义字段识别，而不是通过颜色、数字位置或全页文本猜测。当前已确认的收藏按钮标识为 `data-e2e="video-player-collect"`；当前已收藏状态已确认可读为 `data-e2e-state="video-player-is-collected"`。后续流程中，是否仍处于收藏流，应优先以该状态字段为主判据。
+- **抖音视频型继续条件（当前默认主路径）**：由于当前真实收藏分布中视频是绝大多数、图文/文章是少数，执行时应默认先按“视频型内容”处理。每次 `ArrowDown` 后，若同时满足 `(1) 主内容变化, (2) modal_id 变化, (3) 页面仍是标准视频详情播放器结构, (4) 当前详情页存在 `data-e2e="video-player-collect"` 且其 `data-e2e-state="video-player-is-collected"``，则可视为“成功切到下一条仍在收藏流内的视频项”，继续执行。
+- **抖音内容类型不要误判（强制）**：`AI笔记`、`合集`、`听抖音`、`看相关` 等元素可能出现在正常视频详情页中，它们本身**不能**直接作为“已切到图文/文章”或“已越界推荐流”的依据。判断内容类型时，优先看“中央主区域是否仍是正常可播放视频主体”，而不是只看这些附加标签。
+- **抖音文章/跳转型识别（强规则）**：少数收藏内容不是普通视频，而是“文章/跳转型”详情页。其典型信号是：中央主区域出现“当前内容暂时无法播放 / 需要跳转查看完整内容 / 去查看”这类阻断式提示面板，页面重点从“直接播放视频”变成“点击按钮跳转查看完整内容”；与此同时，当前详情页的收藏按钮仍应保持 `data-e2e="video-player-collect"` 且 `data-e2e-state="video-player-is-collected"`。遇到此类内容时，应判定为“仍在收藏流内的文章/跳转型内容”，而**不是**直接判为越界。
+- **抖音越界停止条件（当前已验证）**：继续 `ArrowDown` 切到新内容后，若当前详情页的收藏按钮不再满足 `data-e2e="video-player-collect"` + `data-e2e-state="video-player-is-collected"`，则应立即判定“已刷出收藏流，进入普通推荐/普通详情流”，并立刻停止；上一条仍满足收藏态判据的内容，视为真正最后一条收藏内容。注意：`modal_id` 变化只说明“内容切换了”，不能单独证明“还在收藏流内”。
+- **抖音三类判定模型（当前推荐）**：
+  1. 普通视频型：中央区域是正常视频播放主体，且收藏按钮满足 `data-e2e="video-player-collect"` + `data-e2e-state="video-player-is-collected"` → 继续。
+  2. 文章/跳转型：中央区域出现“无法播放 / 去查看 / 跳转查看完整内容”面板，且收藏按钮仍满足 `data-e2e="video-player-collect"` + `data-e2e-state="video-player-is-collected"` → 仍属收藏流，按特殊内容记录。
+  3. 非收藏越界型：收藏按钮不再满足 `data-e2e="video-player-collect"` + `data-e2e-state="video-player-is-collected"` → 立即停止。
+- **抖音过时方案（明确废弃）**：不要再把“收藏列表页持续滚动到底并直接抓 `/video/` / `/note/` 链接”当成当前主方案；这条旧路容易混入 footer / SEO / 推荐流，也会把“还能继续刷”误判成“还有收藏”。
+
 2. 读取 `output/feishu-payload.json`。
 3. 执行 `scripts/sync_payload_to_feishu.py`，以 `所属平台 + 链接` 作为去重键写入对应子表：
    - 默认 `create-only`：已存在跳过，不重复写入
    - 可切换 `create-or-update`：已存在则更新
    - 不存在：创建新记录
    - 新记录默认 `状态=未学习`（更新记录不覆盖既有状态）
-   - `标题` 优先从链接页元数据解析（`og:title` / `twitter:title` / `<title>`），失败自动回退并缓存
-   - `内容梗概` 由 OpenClaw 自主读取链接语义并中文概括（不照抄原文，且避免“该仓库/该收藏”开头）
+   - **脚本主要负责结构化搬运，不负责最终内容质量拍板**：采集、去重、链接、平台、数量、时间这些交给脚本
+   - **`标题` 与 `内容梗概` 的最终质量由 OpenClaw 主代理负责**：主代理应读取链接真实内容后，生成简洁、直接、中文、可读的标题与梗概
+   - **新增记录的收尾流程（强制）**：凡是本轮新写入 Feishu Bitable 的记录，主代理都必须在入表后立即逐条复核该批新增记录，并亲自重写 `标题` 与 `内容梗概`；脚本生成的标题/摘要只能视为临时占位草稿，**不能**直接作为最终版交付，也**不能**在未人工回写前把任务视为完成。
+  - **完成判定（强制）**：只有当“新增记录已入表”且“该批新增记录的标题与内容梗概已由主代理人工复写完成”这两个条件同时满足时，才能向用户汇报本轮已完成。
+  - **推荐分工（已验证）**：
+     - 脚本：负责拉取 GitHub stars / X 书签 / 小红书收藏、合并 payload、去重、写入基础结构字段
+     - 抖音：当前以正式流程规则 + 主代理/人工协作为主，probe 脚本只负责探测、排障、辅助验证，不应假定为稳定主采集器
+     - OpenClaw 主代理：负责读取真实页面内容、亲自提炼中文标题、亲自提炼中文梗概、决定最终文案是否入表；这一步不能外包给脚本自动生成。
+   - **标题风格规则**：直接说内容，不要 `GitHub - ...`、`@用户名 · 日期`、链接碎片、导航噪音；能概括主题时，不要只写“xxx 项目”
+   - **内容梗概风格规则**：直接进入内容本身，不要用“这条内容… / 这篇内容… / 这条帖子… / 这个项目…”作为固定开头；避免“重点讨论… / 内容围绕… / 建议结合上下文…”这类模板句
+   - GitHub 梗概优先写：项目用途、解决的问题、适用场景
+   - X 梗概优先写：帖子在讲什么、分享了什么方法/教程/观点/项目
+   - 小红书梗概优先写：笔记分享了什么经验、攻略、做法或避坑信息
+   - 抖音梗概优先写：视频讲了什么主题、方法、教程或观点；若原始摘要仍是热门噪音或拼接流，先不要直接入表，应先清洗
+   - **统一批处理规则（全平台适用）**：标题和梗概阶段默认按 **20 条一批** 执行：先读取这一批真实链接内容，再由主代理人工撰写并回写，确认风格与质量稳定后再继续下一批。
+   - **抖音采集优先级规则**：先保证“链接列表准确”，再做标题/梗概；如果链接集合还不可信（数量对不上、夹带推荐流、重复或误抓），禁止继续批量写文案。
+   - **抖音当前推荐执行方式**：优先遵循正式流程（收藏 -> 视频 -> 首条 -> 详情流 ArrowDown -> 读取 `data-e2e="video-player-collect"` 与 `data-e2e-state` 判断是否仍为 `video-player-is-collected`），再由主代理读取当前已渲染内容并抽取链接集合；不要再把“脚本必须完全替代流程本身”当成当前目标。
+   - 不要把 `GitHub - ...`、`@用户名 · 日期`、链接碎片、`Skip to content`、`Contribute to development...` 这类页面噪音直接写进最终表格
+   - 若批量生成人工文案质量不稳定，优先保持 **20 条一批 + 主代理验收 + 再继续下一批** 的节奏，而不是盲目全量刷新
+   - 使用浏览器读取页面内容时，必须遵守：**一次只开 1 个页面，等待加载，再读取，随后立即关闭**；禁止批量同时打开大量页面，避免浏览器内存膨胀
    - 摘要结果自动缓存到 `output/summary-cache.json`，减少重复调用
    - 标题结果自动缓存到 `output/title-cache.json`，减少重复解析
    - `收藏或星标数量` 按整数写入，GitHub/X/小红书/抖音若采集到均会写入
@@ -143,6 +193,7 @@ python3 ./scripts/sync_payload_to_feishu.py --summary-mode openclaw-native
 ./scripts/collect_github_stars.sh 0
 ./scripts/collect_x_bookmarks.sh 0
 ./scripts/collect_xhs_favorites.sh 0
+# 注意：抖音这个 probe 脚本仅用于探测/排障，不代表正式主流程
 ./scripts/collect_douyin_favorites_probe.sh 0
 ./scripts/add_other_link_record.sh "https://example.com/post/1" "示例梗概"
 ./scripts/merge_to_feishu_payload.sh
@@ -176,3 +227,4 @@ COLLECT_LIMIT=100 ./scripts/run_phase2_probes.sh
 - 目标配置格式：`references/feishu-target-format.md`
 - 配置文件示例：`references/favoriteshub-config.example.json`
 - 当前能力与缺口：`references/platform-gaps.md`
+，允许重放写入。
