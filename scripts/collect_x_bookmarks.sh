@@ -59,6 +59,7 @@ OPEN_JSON="$(openclaw browser open https://x.com/i/bookmarks --json)"
 TARGET_ID="$(echo "$OPEN_JSON" | jq -r '.targetId')"
 
 openclaw browser wait --target-id "$TARGET_ID" --load domcontentloaded --timeout-ms 45000 --json >/dev/null
+sleep 4
 
 EXTRACT_JS="$(cat <<'EOF'
 () => {
@@ -95,12 +96,25 @@ EXTRACT_JS="$(cat <<'EOF'
     return null;
   };
 
-  const cards = [...document.querySelectorAll('article[data-testid="tweet"]')];
+  const cards = [...document.querySelectorAll('article')].filter((card) => {
+    return !!(
+      card.querySelector('a[href*="/status/"]') ||
+      card.querySelector('[data-testid="tweetText"]') ||
+      /bookmarked/i.test(card.innerText || '')
+    );
+  });
   const items = cards.map((card) => {
-    const linkEl = card.querySelector('a[href*="/status/"]');
+    const statusLinks = [...card.querySelectorAll('a[href*="/status/"]')]
+      .map((a) => a.getAttribute('href') || '')
+      .filter(Boolean);
+    const bestHref = statusLinks.find((href) => /^\/[A-Za-z0-9_]+\/status\/\d+/.test(href)) || statusLinks[0] || null;
     const textEl = card.querySelector('[data-testid="tweetText"]');
-    const url = linkEl ? new URL(linkEl.getAttribute('href'), location.origin).toString() : null;
-    const text = (textEl?.innerText || card.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+    const articleTitle = [...card.querySelectorAll('img[alt="Article"], img[aria-label="Article"]')]
+      .map((img) => img.parentElement?.innerText || '')
+      .find(Boolean);
+    const rawText = textEl?.innerText || articleTitle || card.innerText || '';
+    const text = rawText.replace(/\s+/g, ' ').trim().slice(0, 400);
+    const url = bestHref ? new URL(bestHref, location.origin).toString() : null;
     const likeCount = metricFromCard(card, 'like');
     const bookmarkCount = metricFromCard(card, 'bookmark');
     return {
@@ -108,13 +122,15 @@ EXTRACT_JS="$(cat <<'EOF'
       text,
       favorite_or_star_count: (likeCount ?? bookmarkCount ?? null),
     };
-  }).filter((x) => x.url);
+  }).filter((x) => x.url && x.text);
   const pageText = (document.body?.innerText || '').slice(0, 2000);
+  const hasBookmarksHeading = /Bookmarks/i.test(document.body?.innerText || '');
   const requiresLogin = /log in|sign in|登录/i.test(pageText) && items.length === 0;
   return {
     page_url: location.href,
     title: document.title,
     requires_login: requiresLogin,
+    has_bookmarks_heading: hasBookmarksHeading,
     count: items.length,
     items
   };
@@ -143,6 +159,9 @@ while [ "$ROUND" -le "$MAX_SCROLL_ROUNDS" ]; do
   ROUND_ITEMS="$(echo "$EVAL_JSON" | jq -c '.result.items // []')"
 
   if [ "$ROUND" -eq 1 ]; then
+    if [ "$(echo "$EVAL_JSON" | jq -r '.result.has_bookmarks_heading // false')" != "true" ]; then
+      sleep 3
+    fi
     HEAD_CANDIDATES="$(echo "$ROUND_ITEMS" | jq -c '
       reduce .[] as $it ({seen: {}, out: []};
         ($it.url // "") as $u

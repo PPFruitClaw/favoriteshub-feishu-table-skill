@@ -206,6 +206,7 @@ COLLECT_LIMIT=100 ./scripts/run_phase2_probes.sh
 ## 失败处理
 
 - `x` 未登录：`collect_x_bookmarks.sh` 会输出 `requires_login=true`，跳过写入该平台。
+- `x` 新版页面结构 / 慢加载导致脚本可能拿到空列表：优先使用 `browser` 的 `profile="user"` 连接真实 Chrome，在用户完成 attach 确认后，以当前可见 bookmarks 页面做辅助验证；不要把 attach 等待误判为 browser/gateway 故障。
 - `xiaohongshu` 未登录：`collect_xhs_favorites.sh` 输出 `status=needs_login`，在当前 `openclaw browser` 窗口登录后重试。
 - `douyin` 未登录：输出 `status=needs_login`，等待用户登录后重试。
 - 无需外部 API key：默认使用 OpenClaw 内置摘要流程，不阻塞写入。
