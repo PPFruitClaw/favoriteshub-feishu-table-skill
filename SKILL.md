@@ -141,9 +141,10 @@ metadata:
 ### 3) 临时链接入库（other）
 
 1. 接收用户给出的任意链接（非四大平台）。
-2. 由 OpenClaw 自动读取链接内容并生成初始摘要（可选手工覆盖）。
-3. 调用 `scripts/add_other_link_record.sh <url> \"<summary>\"` 生成/更新 `output/other-links.json`（`<summary>` 可省略）。
-4. 写入 `other` 子表：
+2. **若域名为 `mp.weixin.qq.com`，先走当前已跑通的主读取方案；若主方案失败，必须自动尝试 `wechat-article-for-ai` 读取正文并生成 markdown。**
+3. 读取成功后，由 OpenClaw 基于正文生成初始标题与摘要（可选手工覆盖）；只有主方案与保底方案都失败后，才允许回退到保守占位入表并向用户说明。
+4. 调用 `scripts/add_other_link_record.sh <url> \"<summary>\"` 生成/更新 `output/other-links.json`（`<summary>` 可省略）。
+5. 写入 `other` 子表：
    - `所属平台=other`
    - `链接=<url>`
    - `内容梗概=<summary>`
