@@ -1,140 +1,157 @@
 # FavoritesHub-FeishuTable
 
-## 中文说明
+`FavoritesHub-FeishuTable` 是一个把多平台收藏内容统一沉淀到 **飞书多维表格** 的 OpenClaw Skill。
 
-`FavoritesHub-FeishuTable` 是一个 OpenClaw Skill，用于把多个平台的收藏内容聚合到飞书多维表格。
-
-支持平台：
-- 抖音（Douyin）
-- 小红书（Xiaohongshu）
-- X（Twitter）
-- GitHub（Stars）
-- 其他链接（手动补充）
-
-核心能力：
-- 自动初始化飞书多维表（含平台子表与统一字段）
-- 按平台采集收藏/星标内容并合并为统一 payload
-- 默认增量写入（只新增，避免重复）
-- 采集侧支持“首次全量、后续命中边界即停止”
-- 支持跨环境配置兜底（CLI 参数 / 环境变量 / 用户配置文件 / OpenClaw 配置）
-- `内容梗概` 默认由 OpenClaw 自主读链接并生成中文概括（缓存复用，失败自动兜底）
-- 默认要求配置真实飞书用户编辑权限（owner_email/share_members）
-- 授权失败默认不中断初始化，失败明细写入 `failed_members`（可用 `--share-strict` 严格模式）
-- 默认自动尝试转移文档所有权给真实用户（失败明细写入 `owner_transfer`）
-- 支持按邮箱自动解析并缓存 `member_id`（首次后可无感复用）
-- 抖音收藏链路已切换到“`收藏 -> 视频 -> 点击首条进入详情流 -> ArrowDown 逐条切换`”的新主流程，列表页不再作为全量抓取主方案
-- 抖音内容判定已升级为三类：普通视频型 / 文章跳转型 / 非收藏越界型，停止条件以“黄色收藏星标是否仍存在且点亮”为核心
-
-默认初始化结果：
-- 多维表名称：`FavoritesHub-多平台收藏中心`
-- 子表：`github`、`x`、`小红书`、`抖音`、`other`
-
-统一字段：
-- 标题（主字段，多行文本）
-- 所属平台
-- 状态（单选：已学习/已过期/未学习/重点收藏，默认未学习）
-- 链接
-- 内容梗概
-- 收藏或星标数量
-- 收录时间
-
-数量字段说明：
-- `收藏或星标数量` 使用整数写入
-- GitHub / X / 小红书 / 抖音若采集到数量均会写入，不再仅限 GitHub
-- 标题优先从链接页面解析（`og:title` / `twitter:title` / `title`），失败时自动回退
-
-快速开始：
-```bash
-# 1) 初始化飞书多维表（首次）
-python3 ./scripts/init_feishu_bitable.py --owner-email "you@example.com"
-
-# 2) 采集并合并 payload
-# 注意：GitHub / X / 小红书可直接按脚本主流程跑；
-# 抖音当前更推荐先遵循 skill 中定义的正式流程规则，再把结果整理进 payload。
-./scripts/run_phase2_probes.sh
-
-# 3) 同步到飞书
-python3 ./scripts/sync_payload_to_feishu.py
-```
-
-可选一键流程：
-```bash
-./scripts/sync_all_to_feishu.sh
-```
-
-补充说明：
-- 对 GitHub / X / 小红书，这个一键流程基本可视为稳定脚本主路径。
-- 对抖音，这个一键流程里的脚本目前更适合作为**探针 / 过渡排障工具**，不应被理解为已经取代正式流程规则的稳定自动采集器。
-
-注意：
-- 本仓库默认不提交 `output/` 运行产物与本地凭据。
-- 使用前请按 `references/favoriteshub-config.example.json` 配置飞书凭据。
-- 抖音侧不要再沿用“收藏列表页持续滚动到底并直接抓 `/video/` / `/note/` 链接”的旧思路；该方法容易误混 footer / SEO / 推荐流，现已降级为过时方案。
-- 抖音详情流中，`modal_id` 变化只能证明“内容切换了”，不能单独证明“仍在收藏流里”；必须结合页面结构与黄色收藏星标状态共同判断。
+它的重点不是展示“脚本能做什么”，而是帮你把分散在不同平台上的收藏、星标、书签和临时链接，整理成一个**适合长期查看、筛选、学习和回顾**的收藏中心。
 
 ---
 
-## English
+## 这个 Skill 适合什么场景
 
-`FavoritesHub-FeishuTable` is an OpenClaw Skill that aggregates favorites/bookmarks/starred items from multiple platforms into Feishu Bitable.
+适合你有下面这些需求时使用：
 
-Supported sources:
-- Douyin
-- Xiaohongshu
-- X (Twitter)
-- GitHub Stars
-- Manual "Other" links
+- 想把 **GitHub Stars、X 书签、小红书收藏、抖音收藏、其他零散链接** 放到同一个地方统一管理
+- 想让收藏内容不只是“躺在平台里”，而是变成一个可以持续整理和学习的资料库
+- 想在飞书里直接看到一条收藏内容的标题、摘要、链接、平台、数量、时间等信息
+- 想把不同平台的收藏拆成独立子表，但保持整体结构一致，方便筛选和维护
 
-Key capabilities:
-- Auto-initialize Feishu Bitable (platform sub-tables + unified schema)
-- Collect per-platform favorites/stars and merge into one payload
-- Incremental sync by default (`create-only`) to avoid duplicates
-- Collector strategy: full scan on first run, boundary-stop on subsequent runs
-- Multi-environment config fallback (CLI args / env vars / user config / OpenClaw config)
-- `Summary` is generated in Chinese by OpenClaw native reading/summarization by default (with cache + fallback)
-- Requires a real Feishu user editor permission by default (owner_email/share_members)
-- Ownership transfer to the real user is attempted by default (result in `owner_transfer`)
-- Owner member ID can be auto-resolved from email and cached for later no-touch runs
-- Douyin now follows a **flow-first** design: `Favorites -> Video -> open first item -> ArrowDown through detail flow`, with the yellow favorite star as the primary stop signal
-- Douyin classification is now modeled as three states: normal video / article-jump page / crossed-out-of-favorites
+---
 
-Default first-run shape:
-- Bitable name: `FavoritesHub-多平台收藏中心`
-- Sub-tables: `github`, `x`, `小红书`, `抖音`, `other`
+## 支持的平台
 
-Unified fields:
-- Title (primary)
-- Platform
-- Status (single select: 未学习/已学习/已过期/重点收藏; default 未学习)
-- Link
-- Summary
-- Favorite/Star Count
-- Ingested Time
+当前支持：
 
-Count behavior:
-- `Favorite/Star Count` is stored as integer
-- If available, GitHub/X/Xiaohongshu/Douyin counts are all written (not GitHub-only)
-- Title prefers link-page metadata (`og:title` / `twitter:title` / `title`) with automatic fallback
+- **GitHub**：Stars / 星标仓库
+- **X**：Bookmarks / 书签
+- **小红书**：收藏内容
+- **抖音**：收藏内容
+- **其他链接**：手动补充的网页、文章或任意 URL
 
-Quick start:
-```bash
-# 1) Initialize Feishu target (first time)
-python3 ./scripts/init_feishu_bitable.py --owner-email "you@example.com"
+在飞书里，默认会对应生成这些子表：
 
-# 2) Collect and merge payload
-./scripts/run_phase2_probes.sh
+- `github`
+- `x`
+- `小红书`
+- `抖音`
+- `other`
 
-# 3) Sync to Feishu
-python3 ./scripts/sync_payload_to_feishu.py
-```
+---
 
-Optional one-command flow:
-```bash
-./scripts/sync_all_to_feishu.sh
-```
+## 最终在飞书表格里会看到什么
 
-Notes:
-- Runtime artifacts and local credentials are excluded by default (`output/`, local config).
-- Configure Feishu credentials using `references/favoriteshub-config.example.json`.
-- For Douyin, do **not** treat the current probe scripts as the final stable collector. The stable part today is the workflow and stop-rule model, not a fully finalized automation implementation.
-- In Douyin detail flow, `modal_id` change only proves that the content changed; it does **not** prove you are still inside favorites. Combine it with page structure and favorite-star state.
+这是这个 Skill 最重要的部分：**它最终呈现出来的内容是什么。**
+
+所有平台都会统一落到飞书多维表格里，基础字段包括：
+
+- **标题**：这条收藏内容到底是什么
+- **所属平台**：来自 GitHub / X / 小红书 / 抖音 / other
+- **状态**：例如 未学习 / 已学习 / 已过期 / 重点收藏
+- **链接**：原始内容地址
+- **内容梗概**：对这条内容的简洁说明，方便快速判断值不值得点开
+- **收藏或星标数量**：如果平台能拿到，就写入数量
+- **收录时间**：这条内容进入表格的时间
+
+也就是说，最终不是一个“脚本输出文件夹”，而是一个**能直接拿来读、拿来筛选、拿来管理的收藏资料表**。
+
+---
+
+## 平台上的展示差异
+
+虽然所有平台共享一组基础字段，但不同平台也允许有少量扩展字段，用来更好地表达内容。
+
+### X
+
+X 子表当前允许额外包含：
+
+- **作者主页**
+
+其中：
+
+- 链接指向作者主页
+- 显示文本优先用作者的**原始昵称 / 显示名**
+- 不默认显示成 `@handle`
+- 不自己润色、不擅自改写作者昵称
+
+这样在表里看起来更像“人在发内容”，而不是一串平台 handle。
+
+### GitHub
+
+GitHub 子表当前允许额外包含：
+
+- **项目名称**
+
+它和 `标题` 不是一回事：
+
+- **标题** 更偏向“人能一眼看懂这是什么项目”
+- **项目名称** 更偏向“仓库本身的 repo 名称”
+
+比如：
+
+- 标题：`CodePilot：Claude Code 的桌面可视化客户端`
+- 项目名称：`CodePilot`
+
+这样在飞书里既好读，也方便后续精确筛选和结构化处理。
+
+---
+
+## 这个 Skill 的核心价值
+
+它解决的不是“怎么跑某个脚本”，而是下面这些更实际的问题：
+
+- **把多平台收藏统一到一个地方**
+- **把原始收藏变成可阅读、可筛选、可维护的资料表**
+- **减少平台内反复翻找的成本**
+- **让收藏内容从“堆着”变成“可整理、可复盘、可学习”**
+
+你最后得到的是一个飞书里的“收藏内容中心”，而不是一堆散落在各个平台里的原始收藏动作。
+
+---
+
+## 使用方式（简版）
+
+整体流程可以理解为三步：
+
+1. **初始化飞书多维表格**
+2. **从各个平台采集收藏内容**
+3. **把内容同步进飞书，并整理成统一结构**
+
+如果你只是想理解这个 Skill 做什么，到这里已经够了。
+
+如果你需要进一步查看字段规范、平台差异或技术实现细节，再看下面这些文件：
+
+- 字段规范：`references/feishu-schema.md`
+- 目标配置格式：`references/feishu-target-format.md`
+- 当前能力与缺口：`references/platform-gaps.md`
+- Skill 主说明：`SKILL.md`
+
+---
+
+## 技术实现（只做轻量说明）
+
+这个 Skill 内部会结合 OpenClaw、浏览器能力、Feishu Bitable 写入链路，以及各平台对应的采集流程来完成整理。
+
+但对大多数使用者来说，更重要的不是具体脚本名，而是：
+
+- 能采哪些平台
+- 最终进表后长什么样
+- 字段是什么意思
+- 数据是不是适合长期管理
+
+所以 README 只保留轻量技术说明；更细的实现细节，统一放在 Skill 和 references 文件里维护。
+
+---
+
+## 总结
+
+一句话说，这个 Skill 做的事情是：
+
+> **把你分散在多个平台上的收藏内容，整理成一个适合长期使用的飞书收藏资料库。**
+
+如果你想看的不是“它怎么跑”，而是“它最后帮我整理出什么”，那它整理出来的就是：
+
+- 按平台分表
+- 字段统一
+- 内容可读
+- 可筛选、可学习、可复盘
+
+这就是它最核心的价值。
